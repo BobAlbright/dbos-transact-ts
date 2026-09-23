@@ -728,32 +728,139 @@ describe('TimeMatcher', () => {
       return fires;
     };
 
-    const patterns = ['10 19 28-31 * *', '15 16 * * *', '39 * * * *', '*/7 * * * *', '0 0 * * 1'];
+    const patterns = ['10 19 28-31 * *', '15 16 * * *', '39 * * * *', '*/7 * * * *', '0 0 * * 1', '30 2 * * *'];
 
-    // Skipping ahead must land on the same instants as checking every second,
-    // including where a day has 23 or 25 hours.
+    // Skipping ahead must land on the same instants as checking every second.
+    // Standing offsets of 30/45 minutes are not DST; Lord Howe *changes* by 30
+    // minutes, Chatham/St. John's by 60 with a fractional UTC offset.
     describe.each([
-      ['spring forward', '2026-03-08T04:00:00.000Z', '2026-03-08T10:00:00.000Z'],
-      ['fall back', '2026-11-01T04:00:00.000Z', '2026-11-01T10:00:00.000Z'],
-      ['month boundary', '2026-08-31T18:00:00.000Z', '2026-09-01T00:00:00.000Z'],
-    ])('across a %s', (_name, from, to) => {
+      ['America/New_York 1h spring', 'America/New_York', '2026-03-08T04:00:00.000Z', '2026-03-08T10:00:00.000Z'],
+      ['America/New_York 1h fall', 'America/New_York', '2026-11-01T04:00:00.000Z', '2026-11-01T10:00:00.000Z'],
+      ['America/New_York month boundary', 'America/New_York', '2026-08-31T18:00:00.000Z', '2026-09-01T00:00:00.000Z'],
+      ['host-local month boundary', undefined, '2026-08-31T18:00:00.000Z', '2026-09-01T00:00:00.000Z'],
+      ['Asia/Kolkata UTC+5:30', 'Asia/Kolkata', '2026-09-22T10:00:00.000Z', '2026-09-22T16:00:00.000Z'],
+      ['Asia/Kathmandu UTC+5:45', 'Asia/Kathmandu', '2026-09-22T10:00:00.000Z', '2026-09-22T16:00:00.000Z'],
+      [
+        'Australia/Lord_Howe +30m spring',
+        'Australia/Lord_Howe',
+        '2026-10-03T14:00:00.000Z',
+        '2026-10-03T18:00:00.000Z',
+      ],
+      ['Australia/Lord_Howe +30m fall', 'Australia/Lord_Howe', '2026-04-04T13:30:00.000Z', '2026-04-04T17:00:00.000Z'],
+      [
+        'Pacific/Chatham UTC+12:45 1h spring',
+        'Pacific/Chatham',
+        '2026-09-26T12:00:00.000Z',
+        '2026-09-26T18:00:00.000Z',
+      ],
+      ['Pacific/Chatham UTC+13:45 1h fall', 'Pacific/Chatham', '2026-04-04T12:00:00.000Z', '2026-04-04T18:00:00.000Z'],
+      [
+        'America/St_Johns UTC-3:30 1h spring',
+        'America/St_Johns',
+        '2026-03-08T04:00:00.000Z',
+        '2026-03-08T10:00:00.000Z',
+      ],
+      ['America/St_Johns UTC-2:30 1h fall', 'America/St_Johns', '2026-11-01T03:00:00.000Z', '2026-11-01T09:00:00.000Z'],
+    ])('%s', (_name, timezone, from, to) => {
       test.each(patterns)('agrees with a per-second scan for %s', (pattern) => {
         const start = new Date(from);
         const end = new Date(to);
-        for (const timezone of ['America/New_York', undefined]) {
-          expect(scan(pattern, timezone, start, end)).toEqual(everySecond(pattern, timezone, start, end));
-        }
+        expect(scan(pattern, timezone, start, end)).toEqual(everySecond(pattern, timezone, start, end));
       });
     });
 
     test('agrees with a per-second scan over a multi-day gap', () => {
       const start = new Date('2026-08-29T00:00:00.000Z');
       const end = new Date('2026-09-01T00:00:00.000Z');
-      for (const pattern of ['10 19 28-31 * *', '15 16 * * *']) {
+      for (const timezone of ['America/New_York', 'Asia/Kolkata', 'Asia/Kathmandu', 'Pacific/Chatham']) {
+        for (const pattern of ['10 19 28-31 * *', '15 16 * * *', '30 2 * * *']) {
+          expect(scan(pattern, timezone, start, end)).toEqual(everySecond(pattern, timezone, start, end));
+        }
+      }
+    });
+
+    test('next fire after a +5:30 / +5:45 wall time is the next UTC instant of that wall time', () => {
+      const kolkata = new TimeMatcher('15 16 * * *', 'Asia/Kolkata');
+      // 16:15 IST is 10:45 UTC; the next one is 24h later, not 24h minus 30m.
+      expect(kolkata.nextWakeupTime(new Date('2026-09-22T10:45:00.000Z')).toISOString()).toBe(
+        '2026-09-23T10:45:00.000Z',
+      );
+
+      const kathmandu = new TimeMatcher('15 16 * * *', 'Asia/Kathmandu');
+      // 16:15 NPT is 10:30 UTC.
+      expect(kathmandu.nextWakeupTime(new Date('2026-09-22T10:30:00.000Z')).toISOString()).toBe(
+        '2026-09-23T10:30:00.000Z',
+      );
+    });
+
+    test('Lord Howe 30-minute spring-forward does not invent or skip the post-gap 02:30', () => {
+      const matcher = new TimeMatcher('30 2 * * *', 'Australia/Lord_Howe');
+      // 2026-10-04 02:00 local jumps to 02:30 (+10:30 -> +11). 02:00-02:29 do not
+      // exist; 02:30 is the first instant after the gap (2026-10-03T15:30:00Z).
+      const next = matcher.nextWakeupTime(new Date('2026-10-03T14:00:00.000Z'));
+      expect(next.toISOString()).toBe('2026-10-03T15:30:00.000Z');
+      expect(matcher.match(next)).toBe(true);
+      expect(matcher.match(new Date('2026-10-03T15:29:00.000Z'))).toBe(false);
+    });
+
+    test('fall-back overlap fires at both UTC instants of the same wall clock', () => {
+      // 2026-11-01 02:00 EDT -> 01:00 EST. 01:30 happens twice: 05:30Z then 06:30Z.
+      const matcher = new TimeMatcher('30 1 * * *', 'America/New_York');
+      expect(matcher.nextWakeupTime(new Date('2026-11-01T05:00:00.000Z')).toISOString()).toBe(
+        '2026-11-01T05:30:00.000Z',
+      );
+      expect(matcher.nextWakeupTime(new Date('2026-11-01T05:30:00.000Z')).toISOString()).toBe(
+        '2026-11-01T06:30:00.000Z',
+      );
+      expect(
+        scan(
+          '30 1 * * *',
+          'America/New_York',
+          new Date('2026-11-01T05:00:00.000Z'),
+          new Date('2026-11-01T07:00:00.000Z'),
+        ),
+      ).toEqual(['2026-11-01T05:30:00.000Z', '2026-11-01T06:30:00.000Z']);
+    });
+
+    test('day jump across midnight on days the DOM field rejects', () => {
+      // Sep 5–8 are not in 28–31; the skip must walk past local midnight without
+      // inventing a fire. Includes the last two hours before midnight, where the
+      // day jump is not taken (OFFSET_CHANGE_MARGIN_SECONDS).
+      const start = new Date('2026-09-05T03:00:00.000Z');
+      const end = new Date('2026-09-08T04:00:00.000Z');
+      expect(scan('0 0 28-31 * *', 'America/New_York', start, end)).toEqual([]);
+      expect(scan('0 0 28-31 * *', 'America/New_York', start, end)).toEqual(
+        everySecond('0 0 28-31 * *', 'America/New_York', start, end),
+      );
+      expect(scan('0 0 * * *', 'America/New_York', start, end)).toEqual(
+        everySecond('0 0 * * *', 'America/New_York', start, end),
+      );
+    });
+
+    test.each(['5 * * * * *', '0,30 * * * * *', '*/15 * * * * *'])(
+      'second-level expression %s agrees with a per-second scan',
+      (pattern) => {
+        const start = new Date('2026-09-22T12:00:00.000Z');
+        const end = new Date('2026-09-22T12:02:00.000Z');
         expect(scan(pattern, 'America/New_York', start, end)).toEqual(
           everySecond(pattern, 'America/New_York', start, end),
         );
-      }
+      },
+    );
+
+    test('Feb 29 matches only in a leap year', () => {
+      const pattern = '0 0 29 2 *';
+      const tz = 'America/New_York';
+      expect(scan(pattern, tz, new Date('2024-02-28T00:00:00.000Z'), new Date('2024-03-01T10:00:00.000Z'))).toEqual(
+        everySecond(pattern, tz, new Date('2024-02-28T00:00:00.000Z'), new Date('2024-03-01T10:00:00.000Z')),
+      );
+      expect(scan(pattern, tz, new Date('2026-02-28T00:00:00.000Z'), new Date('2026-03-01T10:00:00.000Z'))).toEqual([]);
+    });
+
+    test('a date that never occurs does not hang and does not match', () => {
+      const matcher = new TimeMatcher('0 0 31 2 *', 'America/New_York');
+      const next = matcher.nextWakeupTime(new Date('2026-01-15T00:00:00.000Z'));
+      expect(matcher.match(next)).toBe(false);
     });
 
     test('does not convert every second of a long gap to the schedule timezone', () => {

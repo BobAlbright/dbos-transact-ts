@@ -301,9 +301,14 @@ function matchPattern(pattern: string, nvalue: number) {
   return pattern === value;
 }
 
-// A jump over a stretch that cannot match stops this far short of the next local
-// midnight, so a UTC offset change inside the jump cannot carry it into the next
-// day and skip a match there.
+// Day jumps stop this far short of the next local midnight so a UTC-offset
+// *change* inside the jump cannot carry the landing instant into the next day.
+// The standing offset does not matter (UTC+5:30, +5:45, +12:45 are fine); only
+// how far the offset moves during the jump does. Real DST shifts are 30 or 60
+// minutes (Lord Howe is +30); 2 hours covers those plus a political 1-hour
+// change on the same night. Hour and minute jumps need no margin: an offset
+// change can only land on a wall clock already rejected, or skip one that does
+// not exist (the spring-forward gap).
 const OFFSET_CHANGE_MARGIN_SECONDS = 2 * 60 * 60;
 
 export class TimeMatcher {
@@ -387,9 +392,7 @@ export class TimeMatcher {
       }
     }
 
-    // Crossing to the next local hour or minute is safe without a margin: an
-    // offset change can only land us on a wall clock we have already rejected
-    // or skip one that does not exist.
+    // Crossing to the next local hour or minute is safe without a margin.
     if (!matchPattern(this.#expressions[2], hour)) {
       return (59 - minute) * 60 + (60 - second);
     }
