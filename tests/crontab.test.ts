@@ -699,4 +699,93 @@ describe('TimeMatcher', () => {
         });
         */
   });
+
+  describe('nextWakeupTime', () => {
+    // How backfillSchedule walks the gap between lastFiredAt and now.
+    const scan = (pattern: string, timezone: string | undefined, start: Date, end: Date) => {
+      const matcher = new TimeMatcher(pattern, timezone);
+      const fires: string[] = [];
+      let current = start.getTime();
+      while (current < end.getTime()) {
+        const next = matcher.nextWakeupTime(current);
+        if (!matcher.match(next)) {
+          current = next.getTime();
+          continue;
+        }
+        if (next.getTime() >= end.getTime()) break;
+        fires.push(next.toISOString());
+        current = next.getTime();
+      }
+      return fires;
+    };
+
+    const everySecond = (pattern: string, timezone: string | undefined, start: Date, end: Date) => {
+      const matcher = new TimeMatcher(pattern, timezone);
+      const fires: string[] = [];
+      for (let msec = start.getTime() + 1000; msec < end.getTime(); msec += 1000) {
+        if (matcher.match(msec)) fires.push(new Date(msec).toISOString());
+      }
+      return fires;
+    };
+
+    const patterns = ['10 19 28-31 * *', '15 16 * * *', '39 * * * *', '*/7 * * * *', '0 0 * * 1'];
+
+    // Skipping ahead must land on the same instants as checking every second,
+    // including where a day has 23 or 25 hours.
+    describe.each([
+      ['spring forward', '2026-03-08T04:00:00.000Z', '2026-03-08T10:00:00.000Z'],
+      ['fall back', '2026-11-01T04:00:00.000Z', '2026-11-01T10:00:00.000Z'],
+      ['month boundary', '2026-08-31T18:00:00.000Z', '2026-09-01T00:00:00.000Z'],
+    ])('across a %s', (_name, from, to) => {
+      test.each(patterns)('agrees with a per-second scan for %s', (pattern) => {
+        const start = new Date(from);
+        const end = new Date(to);
+        for (const timezone of ['America/New_York', undefined]) {
+          expect(scan(pattern, timezone, start, end)).toEqual(everySecond(pattern, timezone, start, end));
+        }
+      });
+    });
+
+    test('agrees with a per-second scan over a multi-day gap', () => {
+      const start = new Date('2026-08-29T00:00:00.000Z');
+      const end = new Date('2026-09-01T00:00:00.000Z');
+      for (const pattern of ['10 19 28-31 * *', '15 16 * * *']) {
+        expect(scan(pattern, 'America/New_York', start, end)).toEqual(
+          everySecond(pattern, 'America/New_York', start, end),
+        );
+      }
+    });
+
+    test('does not convert every second of a long gap to the schedule timezone', () => {
+      // A monthly schedule that missed its window leaves three weeks to walk.
+      // Converting each second of that to the schedule's timezone costs seconds
+      // of blocked CPU, and the scheduler does this on the event loop at launch.
+      const realDateTimeFormat = Intl.DateTimeFormat;
+      let formatCalls = 0;
+      const construct = jest
+        .spyOn(Intl, 'DateTimeFormat')
+        .mockImplementation((...args: ConstructorParameters<typeof Intl.DateTimeFormat>) => {
+          const dtf = new realDateTimeFormat(...args);
+          const format = dtf.format.bind(dtf);
+          Object.defineProperty(dtf, 'format', {
+            value: (date?: Date | number) => {
+              formatCalls += 1;
+              return format(date);
+            },
+          });
+          return dtf;
+        });
+      try {
+        scan(
+          '10 19 28-31 * *',
+          'America/New_York',
+          new Date('2026-08-31T23:10:00.000Z'),
+          new Date('2026-09-22T23:00:00.000Z'),
+        );
+        expect(formatCalls).toBeLessThan(50_000);
+      } finally {
+        construct.mockRestore();
+      }
+    });
+  });
 });

@@ -301,17 +301,27 @@ function matchPattern(pattern: string, nvalue: number) {
   return pattern === value;
 }
 
+// A jump over a stretch that cannot match stops this far short of the next local
+// midnight, so a UTC offset change inside the jump cannot carry it into the next
+// day and skip a match there.
+const OFFSET_CHANGE_MARGIN_SECONDS = 2 * 60 * 60;
+
 export class TimeMatcher {
   #pattern: string;
   #expressions: string[];
   #dtf: Intl.DateTimeFormat | null;
   #timezone?: string;
+  #secondValues: number[];
 
   constructor(pattern: string, timezone?: string) {
     validateCrontab(pattern);
     this.#pattern = convertExpression(pattern);
     this.#timezone = timezone;
     this.#expressions = this.#pattern.split(' ');
+    this.#secondValues = this.#expressions[0]
+      .split(',')
+      .map(Number)
+      .sort((a, b) => a - b);
     this.#dtf = this.#timezone
       ? new Intl.DateTimeFormat('en-US', {
           year: 'numeric',
@@ -328,8 +338,10 @@ export class TimeMatcher {
   }
 
   match(date: Date | number) {
-    date = this.#apply(date);
+    return this.#matchesLocal(this.#apply(date));
+  }
 
+  #matchesLocal(date: Date) {
     const runOnSecond = matchPattern(this.#expressions[0], date.getSeconds());
     const runOnMinute = matchPattern(this.#expressions[1], date.getMinutes());
     const runOnHour = matchPattern(this.#expressions[2], date.getHours());
@@ -349,14 +361,44 @@ export class TimeMatcher {
   nextWakeupTime(date: Date | number) {
     // This is conservative.  Some schedules never occur, such as the 30th of February, but you can ask for them
     const time = typeof date === 'number' ? date : date.getTime();
-    let msec = Math.round(time);
-    // This can be optimized by skipping ahead, but unit test first
-    for (let maxIters = 3600; --maxIters; maxIters > 0) {
-      msec += 1000;
-      const nd = new Date(msec);
-      if (this.match(nd)) return nd;
+    let msec = Math.round(time) + 1000;
+    // Each iteration jumps over the largest stretch that provably cannot match,
+    // so the budget is spent on candidate instants rather than on every second
+    // of the gap. A sparse schedule may leave weeks between firings, and one
+    // timezone conversion per second of that is seconds of blocked CPU.
+    for (let maxIters = 3600; maxIters-- > 0; ) {
+      const local = this.#apply(msec);
+      if (this.#matchesLocal(local)) return new Date(msec);
+      msec += 1000 * this.#secondsToSkip(local);
     }
     return new Date(msec);
+  }
+
+  /** Seconds until the next instant that could match, given `local` does not. */
+  #secondsToSkip(local: Date): number {
+    const second = local.getSeconds();
+    const minute = local.getMinutes();
+    const hour = local.getHours();
+
+    if (!this.#runsThisDay(local)) {
+      const untilMidnight = (23 - hour) * 3600 + (59 - minute) * 60 + (60 - second);
+      if (untilMidnight > OFFSET_CHANGE_MARGIN_SECONDS) {
+        return untilMidnight - OFFSET_CHANGE_MARGIN_SECONDS;
+      }
+    }
+
+    // Crossing to the next local hour or minute is safe without a margin: an
+    // offset change can only land us on a wall clock we have already rejected
+    // or skip one that does not exist.
+    if (!matchPattern(this.#expressions[2], hour)) {
+      return (59 - minute) * 60 + (60 - second);
+    }
+    if (!matchPattern(this.#expressions[1], minute)) {
+      return 60 - second;
+    }
+
+    const nextSecond = this.#secondValues.find((s) => s > second);
+    return nextSecond === undefined ? 60 - second + this.#secondValues[0] : nextSecond - second;
   }
 
   #apply(date: Date | number): Date {
