@@ -5,12 +5,16 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { execSync } from 'child_process';
 import { Client } from 'pg';
-import { generateDBOSTestConfig } from './helpers';
-import { ExistenceCheck } from '../src/system_database';
-import { DBOS, WorkflowQueue } from '../src';
+import { generateDBOSTestConfig, describeUnlessSharded } from './helpers';
+import { DBOS } from '../src';
 import { DBOSConfig } from '../dist/src';
 
-describe('schema-command-tests', () => {
+interface ExistenceCheck {
+  exists: boolean;
+}
+
+// Runs the CLI against unsharded databases it creates and resets itself.
+describeUnlessSharded('schema-command-tests', () => {
   test('test schema command with system database URL argument', async () => {
     const config = generateDBOSTestConfig();
     const systemDatabaseUrl = config.systemDatabaseUrl;
@@ -126,7 +130,8 @@ describe('schema-command-tests', () => {
   });
 });
 
-describe('workflow-management-cli-tests', () => {
+// Runs the CLI against unsharded databases it creates and resets itself.
+describeUnlessSharded('workflow-management-cli-tests', () => {
   let config: DBOSConfig;
   let systemDbUrl: string;
 
@@ -142,14 +147,15 @@ describe('workflow-management-cli-tests', () => {
     console.log(schemaOutput.toString());
 
     await DBOS.launch();
-  }, 30000);
+    await DBOS.registerQueue(queue.name, { onConflict: 'always_update' });
+  });
 
   afterAll(async () => {
     await DBOS.shutdown();
-  }, 30000);
+  });
 
   // Define test workflows
-  const queue = new WorkflowQueue('testQ');
+  const queue = { name: 'testQ' };
   const TestWorkflows = {
     simpleWorkflow: DBOS.registerWorkflow(
       async (input: string) => {
@@ -185,6 +191,14 @@ describe('workflow-management-cli-tests', () => {
       },
       { name: 'queuedWorkflow' },
     ),
+
+    bigintWorkflow: DBOS.registerWorkflow(
+      async (input: bigint) => {
+        await Promise.resolve();
+        return input * 2n;
+      },
+      { name: 'bigintWorkflow' },
+    ),
   };
 
   function runCommand(command: string): string {
@@ -214,7 +228,7 @@ describe('workflow-management-cli-tests', () => {
     const workflowIds = workflows.map((w: any) => w.workflowID);
     expect(workflowIds).toContain(handle1.workflowID);
     expect(workflowIds).toContain(handle2.workflowID);
-  }, 30000);
+  });
 
   test('workflow get command', async () => {
     const handle = await DBOS.startWorkflow(TestWorkflows.simpleWorkflow)('test-get');
@@ -227,7 +241,7 @@ describe('workflow-management-cli-tests', () => {
     expect(workflow.workflowID).toBe(workflowId);
     expect(workflow.status).toBe('SUCCESS');
     expect(workflow.workflowName).toBe('simpleWorkflow');
-  }, 30000);
+  });
 
   test('workflow steps command', async () => {
     const handle = await DBOS.startWorkflow(TestWorkflows.multiStepWorkflow)();
@@ -239,7 +253,7 @@ describe('workflow-management-cli-tests', () => {
 
     expect(Array.isArray(steps)).toBe(true);
     expect(steps.length).toBeGreaterThanOrEqual(3);
-  }, 30000);
+  });
 
   test('workflow cancel and resume commands', async () => {
     let handle = await DBOS.startWorkflow(TestWorkflows.longRunningWorkflow)();
@@ -268,7 +282,7 @@ describe('workflow-management-cli-tests', () => {
     expect(['ENQUEUED', 'PENDING', 'SUCCESS']).toContain(resumedWorkflow.status);
     handle = DBOS.retrieveWorkflow(workflowId);
     await handle.getResult();
-  }, 30000);
+  });
 
   test('workflow fork command', async () => {
     const handle = await DBOS.startWorkflow(TestWorkflows.multiStepWorkflow)();
@@ -283,7 +297,7 @@ describe('workflow-management-cli-tests', () => {
     const forkOutput = runCommand(`npx dbos workflow get ${customId} --sys-db-url "${systemDbUrl}"`);
     const forkedWorkflow = JSON.parse(forkOutput);
     expect(['ENQUEUED', 'PENDING', 'SUCCESS']).toContain(forkedWorkflow.status);
-  }, 30000);
+  });
 
   test('workflow queue list command', async () => {
     // Start some queued workflows
@@ -306,7 +320,7 @@ describe('workflow-management-cli-tests', () => {
     for (const handle of handles) {
       await handle.getResult();
     }
-  }, 30000);
+  });
 
   test('workflow list with filters', async () => {
     const handle = await DBOS.startWorkflow(TestWorkflows.simpleWorkflow)('filtered');
@@ -319,7 +333,7 @@ describe('workflow-management-cli-tests', () => {
     expect(successWorkflows.length).toBeGreaterThanOrEqual(1);
     successWorkflows.forEach((w: any) => {
       expect(w.status).toBe('SUCCESS');
-    }, 30000);
+    });
 
     // Test with name filter
     const nameOutput = runCommand(
@@ -331,7 +345,7 @@ describe('workflow-management-cli-tests', () => {
     nameWorkflows.forEach((w: any) => {
       expect(w.workflowName).toBe('simpleWorkflow');
     });
-  }, 30000);
+  });
 
   test('workflow list with time filters', async () => {
     const startTime = new Date();
@@ -357,5 +371,29 @@ describe('workflow-management-cli-tests', () => {
     const excludeWorkflows = JSON.parse(excludeOutput);
     const excludeWorkflowIds = excludeWorkflows.map((w: any) => w.workflowID);
     expect(excludeWorkflowIds).not.toContain(handle.workflowID);
-  }, 30000);
+  });
+
+  test('workflow list and get handle bigint values', async () => {
+    const handle = await DBOS.startWorkflow(TestWorkflows.bigintWorkflow)(42n);
+    const result = await handle.getResult();
+    expect(result).toBe(84n);
+
+    // Verify that list command succeeds and returns valid JSON despite BigInt input/output
+    const listOutput = runCommand(
+      `npx dbos workflow list --name bigintWorkflow --limit 1 --sys-db-url "${systemDbUrl}"`,
+    );
+    const workflows = JSON.parse(listOutput);
+    expect(workflows.length).toBe(1);
+    expect(workflows[0].workflowID).toBe(handle.workflowID);
+    // input and output are now inspect()-ed strings
+    expect(workflows[0].input).toContain('42n');
+    expect(workflows[0].output).toContain('84n');
+
+    // Verify that get command also succeeds with BigInt values
+    const getOutput = runCommand(`npx dbos workflow get ${handle.workflowID} --sys-db-url "${systemDbUrl}"`);
+    const workflow = JSON.parse(getOutput);
+    expect(workflow.workflowID).toBe(handle.workflowID);
+    expect(workflow.status).toBe('SUCCESS');
+    expect(workflow.output).toContain('84n');
+  });
 });

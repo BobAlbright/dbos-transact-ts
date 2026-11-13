@@ -1,12 +1,21 @@
-import { DBOS, WorkflowQueue } from '../src/';
+import { DBOS } from '../src/';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
+import { DBOSWorkflowCancelledError } from '../src/error';
+import { StatusString } from '../src/workflow';
+import { dropPGDatabase } from '../src/database_utils';
+import { ensureTestDatabase } from './helpers';
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
 
 const cockroachdbUrl = process.env.DBOS_COCKROACHDB_URL;
 const describeIf = cockroachdbUrl ? describe : describe.skip;
 
-const testQueue = new WorkflowQueue('crdb-test-queue');
+const silentDropLogger = { warn: () => {} };
+
+const testQueueName = 'crdb-test-queue';
+
+// Building the schema from scratch costs ~40s on CockroachDB, so hooks that may do it need well over the 60s default.
+const CRDB_SCHEMA_TIMEOUT_MS = 180000;
 
 class CRDBTestClass {
   @DBOS.workflow()
@@ -33,6 +42,27 @@ class CRDBTestClass {
     return 'done';
   }
 
+  static publisherRuns = 0;
+
+  @DBOS.workflow()
+  static async rewindPublisher() {
+    CRDBTestClass.publisherRuns += 1;
+    await DBOS.setEvent('below', 'kept');
+    await DBOS.setEvent('both', 'old');
+    if (CRDBTestClass.publisherRuns === 1) {
+      await DBOS.setEvent('both', 'new');
+      await DBOS.setEvent('above', 'doomed');
+    }
+    return CRDBTestClass.publisherRuns;
+  }
+
+  @DBOS.workflow()
+  static async blockedWorkflow() {
+    while (true) {
+      await DBOS.sleep(100);
+    }
+  }
+
   @DBOS.workflow()
   static async streamWriterWorkflow(streamKey: string, testValues: unknown[]) {
     for (const value of testValues) {
@@ -50,25 +80,23 @@ describeIf('cockroachdb', () => {
     url.pathname = '/dbos_test';
     const systemDatabaseUrl = url.toString();
 
-    const client = new Client({ connectionString: cockroachdbUrl });
-    await client.connect();
-    await client.query('DROP DATABASE IF EXISTS dbos_test');
-    await client.query('CREATE DATABASE dbos_test');
-    await client.end();
+    await dropPGDatabase(systemDatabaseUrl, silentDropLogger);
+    await ensureTestDatabase(systemDatabaseUrl);
     config = {
       name: 'cockroachdb-test',
       systemDatabaseUrl,
       useListenNotify: false,
     };
     DBOS.setConfig(config);
-  });
+  }, CRDB_SCHEMA_TIMEOUT_MS);
 
   beforeEach(async () => {
     await DBOS.launch();
+    await DBOS.registerQueue(testQueueName, { onConflict: 'always_update' });
     const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
     sysDB.dbPollingIntervalResultMs = 100;
     sysDB.dbPollingIntervalEventMs = 100;
-  }, 60000);
+  }, CRDB_SCHEMA_TIMEOUT_MS);
 
   afterEach(async () => {
     await DBOS.shutdown();
@@ -81,7 +109,7 @@ describeIf('cockroachdb', () => {
   });
 
   test('workflow-on-queue', async () => {
-    const handle = await DBOS.startWorkflow(CRDBTestClass, { queueName: testQueue.name }).testWorkflow('queued');
+    const handle = await DBOS.startWorkflow(CRDBTestClass, { queueName: testQueueName }).testWorkflow('queued');
     expect(await handle.getResult()).toBe('QUEUED');
     const status = await handle.getStatus();
     expect(status?.queueName).toBe('crdb-test-queue');
@@ -91,7 +119,7 @@ describeIf('cockroachdb', () => {
     const handle = await DBOS.startWorkflow(CRDBTestClass).receiveWorkflow();
     await DBOS.send(handle.workflowID, 'hello');
     expect(await handle.getResult()).toBe('hello');
-  }, 10000);
+  });
 
   test('set-and-get-events', async () => {
     const handle = await DBOS.startWorkflow(CRDBTestClass).eventWorkflow();
@@ -106,6 +134,29 @@ describeIf('cockroachdb', () => {
     await forkedHandle.getResult();
     await expect(DBOS.getEvent(forkedHandle.workflowID, 'key1')).resolves.toBe('value1');
     await expect(DBOS.getEvent(forkedHandle.workflowID, 'key2')).resolves.toBe('value2');
+  });
+
+  // Rewind's behaviour is covered in rewind.test.ts; this only runs its query shapes
+  // on CockroachDB: a correlated EXISTS against the events history in a DELETE and a
+  // SELECT, row_number() over that history partitioned by key, and INSERT ... FROM
+  // SELECT off the subquery that filters on it. One key set on both sides of the cut
+  // and one set only past it reach all three.
+  test('rewind', async () => {
+    CRDBTestClass.publisherRuns = 0;
+    const handle = await DBOS.startWorkflow(CRDBTestClass).rewindPublisher();
+    expect(await handle.getResult()).toBe(1);
+    const workflowID = handle.workflowID;
+    await expect(DBOS.getEvent(workflowID, 'both', 0)).resolves.toBe('new');
+    await expect(DBOS.getEvent(workflowID, 'above', 0)).resolves.toBe('doomed');
+
+    // Cut between the two setEvents on "both".
+    const rewound = await DBOS.rewindWorkflow<number>(workflowID, { startStep: 2 });
+    expect(await rewound.getResult()).toBe(2);
+    await expect(DBOS.getEvent(workflowID, 'below', 0)).resolves.toBe('kept');
+    // Reverted to the value published below the cut.
+    await expect(DBOS.getEvent(workflowID, 'both', 0)).resolves.toBe('old');
+    // Published only past the cut, so unpublished and never set again.
+    await expect(DBOS.getEvent(workflowID, 'above', 0)).resolves.toBeNull();
   });
 
   test('list-workflows', async () => {
@@ -197,5 +248,17 @@ describeIf('cockroachdb', () => {
       await client.end();
     }
     expect(await handle.getResult()).toBe('hello');
-  }, 10000);
+  });
+
+  test('workflow-timeout', async () => {
+    // Run the sweep directly first, so an unsupported statement fails here with its own error.
+    await expect(DBOSExecutor.globalInstance!.systemDatabase.cancelTimedOutWorkflows(10)).resolves.toBeInstanceOf(
+      Array,
+    );
+
+    const workflowID = randomUUID();
+    const handle = await DBOS.startWorkflow(CRDBTestClass, { workflowID, timeoutMS: 100 }).blockedWorkflow();
+    await expect(handle.getResult()).rejects.toThrow(new DBOSWorkflowCancelledError(workflowID));
+    expect((await handle.getStatus())?.status).toBe(StatusString.CANCELLED);
+  });
 });

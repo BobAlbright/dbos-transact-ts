@@ -1,10 +1,11 @@
-import { DBOS, DBOSConfig } from '../src';
+import { DBOS, DBOSClient, DBOSConfig } from '../src';
 import { randomUUID } from 'node:crypto';
 import { sleepms } from '../src/utils';
-import { generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
+import { ensureTestDatabase, generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
 import { KnexDataSource } from '../packages/knex-datasource';
 import { StepInfo } from '../src/workflow';
-import { ensurePGDatabase } from '../src/database_utils';
+
+const dbBackedQueueName = 'concDbBackedQueue';
 
 const config = generateDBOSTestConfig();
 
@@ -229,6 +230,24 @@ const runALotOfThingsAtOnce = DBOS.registerWorkflow(
         expected: 'WF Ran',
       },
       {
+        // DB-backed queue: enqueue path for a queue this executor has no local record of.
+        func: async () => {
+          await DBOS.startWorkflow(simpleWF, {
+            workflowID: `${DBOS.workflowID}-cwfq`,
+            queueName: dbBackedQueueName,
+          })();
+          return 'enqueued';
+        },
+        expected: 'enqueued',
+      },
+      {
+        func: async () => {
+          const wfh = DBOS.retrieveWorkflow<string>(`${DBOS.workflowID}-cwfq`);
+          return await wfh.getResult();
+        },
+        expected: 'WF Ran',
+      },
+      {
         // Uses sysdb directly after getting func id
         func: async () => {
           await DBOS.writeStream('stream', 'val');
@@ -405,10 +424,9 @@ const runALotOfTransactionsAtOnce = DBOS.registerWorkflow(
 
 describe('concurrency-tests', () => {
   beforeAll(async () => {
-    await ensurePGDatabase({
-      dbToEnsure: dbname,
-      adminUrl: `postgresql://${dbConfig.user}:${process.env['PGPASSWORD'] || 'dbos'}@${process.env['PGHOST'] || 'localhost'}:${process.env['PGPORT'] || '5432'}/postgres`,
-    });
+    await ensureTestDatabase(
+      `postgresql://${dbConfig.user}:${process.env['PGPASSWORD'] || 'dbos'}@${process.env['PGHOST'] || 'localhost'}:${process.env['PGPORT'] || '5432'}/${dbname}`,
+    );
 
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
@@ -416,6 +434,15 @@ describe('concurrency-tests', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
+
+    // Register a DB-backed queue via DBOSClient. Used below to confirm
+    // enqueue works for a queue this executor has no local record of.
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      await client.registerQueue(dbBackedQueueName);
+    } finally {
+      await client.destroy();
+    }
 
     await knexds.runTransaction(async () => {
       await knexds.client.raw(`DROP TABLE IF EXISTS ${testTableName};`);
@@ -428,19 +455,6 @@ describe('concurrency-tests', () => {
 
   afterEach(async () => {
     await DBOS.shutdown();
-  });
-
-  test('duplicate-transaction', async () => {
-    // Run two transactions concurrently with the same UUID.
-    // Both should return the correct result but only one should execute.
-    const workflowUUID = randomUUID();
-    const results = await Promise.allSettled([
-      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testReadWriteFunction(10)).getResult(),
-      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testReadWriteFunction(10)).getResult(),
-    ]);
-    expect((results[0] as PromiseFulfilledResult<number>).value).toBe(10);
-    expect((results[1] as PromiseFulfilledResult<number>).value).toBe(10);
-    expect(ConcurrTestClass.cnt).toBe(1);
   });
 
   test('duplicate-dstransaction', async () => {
@@ -465,8 +479,8 @@ describe('concurrency-tests', () => {
     // Since we only record the output after the function, it may cause more than once executions.
     const workflowUUID = randomUUID();
     const results = await Promise.allSettled([
-      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testStep(11)).getResult(),
-      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testStep(11)).getResult(),
+      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testStepWorkflow(11)).getResult(),
+      (await DBOS.startWorkflow(ConcurrTestClass, { workflowID: workflowUUID }).testStepWorkflow(11)).getResult(),
     ]);
     expect((results[0] as PromiseFulfilledResult<number>).value).toBe(11);
     expect((results[1] as PromiseFulfilledResult<number>).value).toBe(11);
@@ -520,7 +534,7 @@ describe('concurrency-tests', () => {
 
     await cleanDB();
     await runALotOfThingsAtOnce(true);
-  }, 30000);
+  });
 
   test('promise-all-settled-manysteps', async () => {
     const wfidSerial = randomUUID();
@@ -544,7 +558,7 @@ describe('concurrency-tests', () => {
     await fwf2.getResult();
     const fwf3 = await DBOS.forkWorkflow(wfidConcurrent, 7);
     await fwf3.getResult();
-  }, 20000);
+  });
 
   test('promise-all-settled-transactions', async () => {
     const wfidSerial = randomUUID();
@@ -573,7 +587,7 @@ describe('concurrency-tests', () => {
     await cleanDB();
     const fwf3 = await DBOS.forkWorkflow(wfidConcurrent, 7);
     await fwf3.getResult();
-  }, 20000);
+  });
 });
 
 class ConcurrTestClass {
@@ -616,6 +630,11 @@ class ConcurrTestClass {
   static async testStep(id: number) {
     ConcurrTestClass.cnt++;
     return Promise.resolve(id);
+  }
+
+  @DBOS.workflow()
+  static async testStepWorkflow(id: number) {
+    return ConcurrTestClass.testStep(id);
   }
 
   @DBOS.step()

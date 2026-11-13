@@ -1,4 +1,4 @@
-import { ConfiguredInstance, DBOS, WorkflowQueue } from '../src';
+import { ConfiguredInstance, DBOS } from '../src';
 
 export class DBOSWFTest {
   @DBOS.step()
@@ -13,15 +13,16 @@ export class DBOSWFTest {
 
   static ran = false;
 
-  @DBOS.scheduled({ crontab: '* * * * * *' })
+  // Scheduled by clear-reg.test.ts after launch, since schedules live in the database.
   @DBOS.workflow()
-  static async scheduledWF(_1: Date, _2: Date) {
+  static async scheduledWF(_scheduledDate: Date, _context: unknown) {
     DBOSWFTest.ran = true;
-    return await DBOSWFTest.runStep();
+    await DBOSWFTest.runStep();
   }
 }
 
-export const queue = new WorkflowQueue('example_queue');
+// Registered as a database-backed queue by clear-reg.test.ts after launch.
+export const queue = { name: 'example_queue' };
 
 class TestFunctions extends ConfiguredInstance {
   constructor(name: string) {

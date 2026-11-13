@@ -1,19 +1,13 @@
-import { InMemorySpanExporter, ReadableSpan, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { InMemorySpanExporter, ReadableSpan, SimpleSpanProcessor, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from './nodetraceprovider';
 import { DBOS } from '../src';
-
-const memoryExporter = new InMemorySpanExporter();
-const provider = new NodeTracerProvider({
-  spanProcessors: [new SimpleSpanProcessor(memoryExporter)],
-});
-provider.register();
-
-import Koa from 'koa';
-import Router from '@koa/router';
 import { context, trace, SpanStatusCode } from '@opentelemetry/api';
 import { isTraceContextWorking } from '../src/telemetry/traces';
 import { AddressInfo } from 'net';
+import http from 'http';
 import { globalParams } from '../src/utils';
+import { randomUUID } from 'node:crypto';
+import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
 
 async function tracedStep() {
   return Promise.resolve();
@@ -24,7 +18,7 @@ async function doSomethingTraced_internal() {
   if (span) {
     span.setAttribute('my-lib.didSomething', true);
   }
-  if (globalParams.enableOTLP) {
+  if (globalParams.tracingEnabled) {
     expect(DBOS.span).toBe(trace.getSpan(context.active()));
   }
   await DBOS.runStep(tracedStep, { name: 'tracedStep' });
@@ -33,74 +27,86 @@ async function doSomethingTraced_internal() {
 
 const doSomethingTraced = DBOS.registerWorkflow(doSomethingTraced_internal);
 
-export function createApp() {
-  const app = new Koa();
-  const router = new Router();
+function createApp() {
+  return http.createServer((req, res) => {
+    void (async () => {
+      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
-  // Tracing middleware (emulates instrumentation or full middleware, which is not working...)
-  app.use(async (ctx, next) => {
-    const current = trace.getSpan(context.active());
-    if (current) {
-      return next() as Promise<unknown>;
-    }
-
-    const tracer = trace.getTracer('manual');
-    const span = tracer.startSpan(`manual-span-for-${ctx.method} ${ctx.path}`);
-
-    try {
-      await context.with(trace.setSpan(context.active(), span), async () => {
-        await next();
-        if (ctx.status >= 400) {
-          span.setStatus({ code: SpanStatusCode.ERROR, message: ctx.message });
+      const handle = async () => {
+        if (req.method === 'GET' && path === '/test') {
+          await doSomethingTraced();
+          res.statusCode = 200;
+          res.end('OK');
         } else {
-          span.setStatus({ code: SpanStatusCode.OK });
+          res.statusCode = 404;
+          res.end('Not Found');
         }
-      });
-    } catch (err) {
-      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
-      throw err;
-    } finally {
-      span.end();
-    }
+      };
+
+      if (trace.getSpan(context.active())) {
+        await handle();
+        return;
+      }
+
+      const tracer = trace.getTracer('manual');
+      const span = tracer.startSpan(`manual-span-for-${req.method} ${path}`);
+
+      try {
+        await context.with(trace.setSpan(context.active(), span), async () => {
+          await handle();
+          if (res.statusCode >= 400) {
+            span.setStatus({ code: SpanStatusCode.ERROR, message: res.statusMessage });
+          } else {
+            span.setStatus({ code: SpanStatusCode.OK });
+          }
+        });
+      } catch (err) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        if (!res.writableEnded) {
+          res.statusCode = 500;
+          res.end();
+        }
+      } finally {
+        span.end();
+      }
+    })().catch(() => {
+      // Koa answered every handler throw with a 500; without this the socket would hang.
+      if (!res.writableEnded) {
+        res.statusCode = 500;
+        res.end();
+      }
+    });
   });
-
-  // Route
-  router.get('/test', async (ctx) => {
-    await doSomethingTraced();
-    ctx.body = 'OK';
-  });
-
-  app.use(router.routes());
-  app.use(router.allowedMethods());
-
-  return app;
 }
 
 function getParentSpanID(span: ReadableSpan) {
   const ctx = span.parentSpanContext;
-  if (ctx) {
-    return ctx.spanId;
-  } else {
-    return undefined;
-  }
+  return ctx ? ctx.spanId : undefined;
 }
 
-describe('trace spans propagate ', () => {
+describe('trace spans propagate', () => {
+  const memoryExporter = new InMemorySpanExporter();
+
   beforeAll(async () => {
-    memoryExporter.reset();
+    const provider = new NodeTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(memoryExporter)],
+    });
+    provider.register();
     DBOS.setConfig({ name: 'trace-span-propagate', enableOTLP: true });
     await DBOS.launch();
   });
 
   afterAll(async () => {
     await DBOS.shutdown();
+    trace.disable();
+    context.disable();
   });
 
   test('from-outside-into-DBOS-calls', async () => {
     expect(isTraceContextWorking()).toBe(true);
 
     const app = createApp();
-    const server = app.listen(0); // Koa uses native HTTP
+    const server = app.listen(0);
 
     const { port } = server.address() as AddressInfo;
 
@@ -135,21 +141,28 @@ describe('trace spans propagate ', () => {
 });
 
 describe('disable-otlp', () => {
+  const memoryExporter = new InMemorySpanExporter();
+
   beforeAll(async () => {
-    memoryExporter.reset();
+    const provider = new NodeTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(memoryExporter)],
+    });
+    provider.register();
     DBOS.setConfig({ name: 'trace-span-propagate' });
     await DBOS.launch();
   });
 
   afterAll(async () => {
     await DBOS.shutdown();
+    trace.disable();
+    context.disable();
   });
 
   test('disable-otlp', async () => {
     expect(isTraceContextWorking()).toBe(false);
 
     const app = createApp();
-    const server = app.listen(0); // Koa uses native HTTP
+    const server = app.listen(0);
 
     const { port } = server.address() as AddressInfo;
 
@@ -161,5 +174,140 @@ describe('disable-otlp', () => {
     // With OTLP disabled, only the HTTP span is present
     const spans = memoryExporter.getFinishedSpans();
     expect(spans.length).toBe(1);
+  });
+});
+
+describe('external-provider-span-propagation', () => {
+  const memoryExporter = new InMemorySpanExporter();
+
+  beforeAll(async () => {
+    const provider = new NodeTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(memoryExporter)],
+    });
+    provider.register();
+    DBOS.setConfig({ name: 'external-provider-test', tracingEnabled: true });
+    await DBOS.launch();
+  });
+
+  afterAll(async () => {
+    await DBOS.shutdown();
+    trace.disable();
+    context.disable();
+  });
+
+  test('spans-flow-through-external-provider', async () => {
+    expect(isTraceContextWorking()).toBe(true);
+
+    const app = createApp();
+    const server = app.listen(0);
+
+    const { port } = server.address() as AddressInfo;
+
+    const res = await fetch(`http://localhost:${port}/test`);
+
+    expect(res.status).toBe(200);
+    server.close();
+
+    const spans = memoryExporter.getFinishedSpans();
+    const realSpans = spans.filter((s) => s.name !== 'probe');
+    expect(realSpans.length).toBe(3);
+
+    const stepSpan = realSpans[0];
+    const workflowSpan = realSpans[1];
+    const httpSpan = realSpans[2];
+
+    expect(getParentSpanID(stepSpan)).toBe(workflowSpan?.spanContext().spanId);
+    expect(stepSpan?.spanContext().traceId).toBe(workflowSpan?.spanContext().traceId);
+    expect(getParentSpanID(workflowSpan)).toBe(httpSpan?.spanContext().spanId);
+    expect(workflowSpan?.spanContext().traceId).toBe(httpSpan?.spanContext().traceId);
+  });
+});
+
+describe('dbos-standalone-tracing', () => {
+  beforeAll(async () => {
+    // No external provider — DBOS sets up its own BasicTracerProvider and context manager
+    DBOS.setConfig({ name: 'standalone-tracing-test', enableOTLP: true });
+    await DBOS.launch();
+  });
+
+  afterAll(async () => {
+    await DBOS.shutdown();
+    trace.disable();
+    context.disable();
+  });
+
+  test('context-propagation-works', () => {
+    expect(isTraceContextWorking()).toBe(true);
+  });
+
+  test('workflows-produce-real-spans', async () => {
+    const result = await doSomethingTraced();
+    expect(result).toBe('Done');
+  });
+});
+
+const spanChild = DBOS.registerWorkflow(async () => Promise.resolve(), { name: 'spanChild' });
+const spanParent = DBOS.registerWorkflow(
+  async (childID: string) => {
+    await (await DBOS.startWorkflow(spanChild, { workflowID: childID })()).getResult();
+  },
+  { name: 'spanParent' },
+);
+
+// A span that never ends is never exported, and tracers that export whole traces then drop the caller's trace too.
+describe('workflow-span-only-for-runs', () => {
+  const memoryExporter = new InMemorySpanExporter();
+  const startedSpans: ReadableSpan[] = [];
+  const startTracker: SpanProcessor = {
+    onStart: (span) => void startedSpans.push(span),
+    onEnd: () => {},
+    forceFlush: () => Promise.resolve(),
+    shutdown: () => Promise.resolve(),
+  };
+
+  beforeAll(async () => {
+    const provider = new NodeTracerProvider({
+      spanProcessors: [startTracker, new SimpleSpanProcessor(memoryExporter)],
+    });
+    provider.register();
+    const config = { ...generateDBOSTestConfig(), tracingEnabled: true };
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+    await DBOS.launch();
+  });
+
+  afterAll(async () => {
+    await DBOS.shutdown();
+    trace.disable();
+    context.disable();
+  });
+
+  // [started, ended] workflow spans for this workflow ID.
+  function spanCounts(workflowID: string) {
+    const matches = (s: ReadableSpan) => s.attributes['operationUUID'] === workflowID;
+    return [startedSpans.filter(matches).length, memoryExporter.getFinishedSpans().filter(matches).length];
+  }
+
+  test('enqueue', async () => {
+    // Nothing dequeues from this queue, so the workflow does not run here.
+    const handle = await DBOS.startWorkflow(spanChild, { queueName: 'span-test-unserved' })();
+    expect(spanCounts(handle.workflowID)).toEqual([0, 0]);
+  });
+
+  test('start-of-an-existing-workflow', async () => {
+    const workflowID = randomUUID();
+    await (await DBOS.startWorkflow(spanChild, { workflowID })()).getResult();
+    await DBOS.startWorkflow(spanChild, { workflowID })();
+    expect(spanCounts(workflowID)).toEqual([1, 1]);
+  });
+
+  test('replayed-child-start', async () => {
+    const parentID = randomUUID();
+    const childID = randomUUID();
+    await (await DBOS.startWorkflow(spanParent, { workflowID: parentID })(childID)).getResult();
+    expect(spanCounts(childID)).toEqual([1, 1]);
+
+    await (await reexecuteWorkflowById(parentID)).getResult();
+    expect(spanCounts(childID)).toEqual([1, 1]);
   });
 });

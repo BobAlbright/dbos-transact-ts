@@ -2,7 +2,13 @@ import { DBOS, ConfiguredInstance } from '../src/';
 import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
 import { randomUUID } from 'node:crypto';
 import { StatusString } from '../src/workflow';
-import { DBOSError, DBOSMaxStepRetriesError, DBOSNotRegisteredError, DBOSUnexpectedStepError } from '../src/error';
+import {
+  DBOSError,
+  DBOSMaxStepRetriesError,
+  DBOSNotRegisteredError,
+  getDBOSErrorCode,
+  UnexpectedStep,
+} from '../src/error';
 import { DBOSConfig } from '../src/dbos-executor';
 
 describe('failures-tests', () => {
@@ -29,7 +35,9 @@ describe('failures-tests', () => {
     await DBOS.withNextWorkflowID(
       wfUUID1,
       async () =>
-        await expect(FailureTestClass.testStep(11)).rejects.toThrow(new DBOSError('test dbos error with code.', 11)),
+        await expect(FailureTestClass.testStepWorkflow(11)).rejects.toThrow(
+          new DBOSError('test dbos error with code.', 11),
+        ),
     );
 
     const retrievedHandle = DBOS.retrieveWorkflow<string>(wfUUID1);
@@ -37,20 +45,24 @@ describe('failures-tests', () => {
     await expect(retrievedHandle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
-    await expect(retrievedHandle.getResult()).rejects.toThrow(new DBOSError('test dbos error with code.', 11));
+    // A recorded error comes back deserialized as a plain Error carrying the original fields.
+    await expect(retrievedHandle.getResult()).rejects.toMatchObject({
+      message: 'test dbos error with code.',
+      dbosErrorCode: 11,
+    });
 
-    // Test without code.
+    // Outside a workflow a step is a plain call, so the error arrives unwrapped and nothing is recorded.
     await expect(FailureTestClass.testStep()).rejects.toThrow(new DBOSError('test dbos error without code.'));
   });
 
   test('failing-step', async () => {
     let startTime = Date.now();
-    await expect(FailureTestClass.testFailStep()).resolves.toBe(2);
+    await expect(FailureTestClass.testFailStepWorkflow()).resolves.toBe(2);
     expect(Date.now() - startTime).toBeGreaterThanOrEqual(1000);
 
     startTime = Date.now();
     try {
-      await FailureTestClass.testFailStep();
+      await FailureTestClass.testFailStepWorkflow();
       expect(true).toBe(false); // An exception should be thrown first
     } catch (error) {
       const e = error as DBOSMaxStepRetriesError;
@@ -60,6 +72,20 @@ describe('failures-tests', () => {
       expect(e.errors[1].message).toBe('bad number');
     }
     expect(Date.now() - startTime).toBeGreaterThanOrEqual(1000);
+
+    // A workflow hosts the step, so its retry policy and step context apply.
+    FailureTestClass.cnt = 0;
+    FailureTestClass.sawStepContext = false;
+    await expect(FailureTestClass.alwaysFailsStepWorkflow()).rejects.toThrow(DBOSMaxStepRetriesError);
+    expect(FailureTestClass.cnt).toBe(3);
+    expect(FailureTestClass.sawStepContext).toBe(true);
+
+    // Called outside a workflow the same step is an ordinary function call: one attempt, raw error.
+    FailureTestClass.cnt = 0;
+    FailureTestClass.sawStepContext = true;
+    await expect(FailureTestClass.alwaysFailsStep()).rejects.toThrow(new Error('always fails'));
+    expect(FailureTestClass.cnt).toBe(1);
+    expect(FailureTestClass.sawStepContext).toBe(false);
   });
 
   test('nonretry-step', async () => {
@@ -67,15 +93,136 @@ describe('failures-tests', () => {
 
     // Should throw an error.
     await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await expect(FailureTestClass.testNoRetry()).rejects.toThrow(new Error('failed no retry'));
+      await expect(FailureTestClass.testNoRetryWF()).rejects.toThrow(new Error('failed no retry'));
     });
     expect(FailureTestClass.cnt).toBe(1);
 
     // If we retry again, we should get the same error, but numRun should still be 1 (OAOO).
     await DBOS.withNextWorkflowID(workflowUUID, async () => {
-      await expect(FailureTestClass.testNoRetry()).rejects.toThrow(new Error('failed no retry'));
+      await expect(FailureTestClass.testNoRetryWF()).rejects.toThrow(new Error('failed no retry'));
     });
     expect(FailureTestClass.cnt).toBe(1);
+  });
+
+  test('shouldRetry-false-stops-retried-runStep', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testShouldRetryFalseRunStep()).rejects.toThrow('permanent');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+
+    const steps = (await DBOS.listWorkflowSteps(workflowUUID))!;
+    expect(steps.length).toBe(1);
+    expect(steps[0].name).toBe('should-retry-false-run-step');
+    expect(steps[0].output).toBeNull();
+    expect(steps[0].error).not.toBeNull();
+    expect(steps[0].error!.message).toBe('permanent');
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      try {
+        await FailureTestClass.testShouldRetryFalseRunStep();
+        expect(true).toBe(false); // An exception should be thrown first
+      } catch (error) {
+        const e = error as Error;
+        expect(e.message).toBe('permanent');
+      }
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+  });
+
+  test('shouldRetry-false-stops-retried-decorated-step', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testShouldRetryFalseDecoratedStepWorkflow()).rejects.toThrow('decorated permanent');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+
+    const steps = (await DBOS.listWorkflowSteps(workflowUUID))!;
+    expect(steps.length).toBe(1);
+    expect(steps[0].name).toBe('testShouldRetryFalseDecoratedStep');
+    expect(steps[0].error).not.toBeNull();
+    expect(steps[0].error!.message).toBe('decorated permanent');
+  });
+
+  test('ordinary-error-exhausts-retried-runStep', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      try {
+        await FailureTestClass.testOrdinaryRetriedRunStep();
+        expect(true).toBe(false); // An exception should be thrown first
+      } catch (error) {
+        const e = error as DBOSMaxStepRetriesError;
+        expect(e).toBeInstanceOf(DBOSMaxStepRetriesError);
+        expect(e.message).toContain('Step ordinary-retried-run-step has exceeded its maximum of 3 retries.');
+        expect(e.errors.length).toBe(3);
+        expect(e.errors.every((err) => err.message === 'temporary')).toBe(true);
+      }
+    });
+    expect(FailureTestClass.cnt).toBe(3);
+  });
+
+  test('shouldRetry-true-retries-until-success', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testShouldRetryTrueRunStep()).resolves.toBe(3);
+    });
+    expect(FailureTestClass.cnt).toBe(3);
+  });
+
+  test('async-shouldRetry-false-stops-retried-runStep', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testAsyncShouldRetryFalseRunStep()).rejects.toThrow('async permanent');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+
+    const steps = (await DBOS.listWorkflowSteps(workflowUUID))!;
+    expect(steps.length).toBe(1);
+    expect(steps[0].error).not.toBeNull();
+    expect(steps[0].error!.message).toBe('async permanent');
+  });
+
+  test('shouldRetry-throwing-error-is-recorded-and-propagated', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testThrowingShouldRetryRunStep()).rejects.toThrow('predicate failed');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+
+    const steps = (await DBOS.listWorkflowSteps(workflowUUID))!;
+    expect(steps.length).toBe(1);
+    expect(steps[0].error).not.toBeNull();
+    expect(steps[0].error!.message).toBe('predicate failed');
+  });
+
+  test('shouldRetry-rejecting-error-is-recorded-and-propagated', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testRejectingShouldRetryRunStep()).rejects.toThrow('predicate rejected');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+
+    const steps = (await DBOS.listWorkflowSteps(workflowUUID))!;
+    expect(steps.length).toBe(1);
+    expect(steps[0].error).not.toBeNull();
+    expect(steps[0].error!.message).toBe('predicate rejected');
+  });
+
+  test('shouldRetry-is-ignored-when-retries-not-allowed', async () => {
+    const workflowUUID = randomUUID();
+
+    await DBOS.withNextWorkflowID(workflowUUID, async () => {
+      await expect(FailureTestClass.testShouldRetryWithoutRetriesRunStep()).rejects.toThrow('no retries');
+    });
+    expect(FailureTestClass.cnt).toBe(1);
+    expect(FailureTestClass.success).toBe('');
   });
 
   test('no-registration-startwf', async () => {
@@ -142,7 +289,12 @@ describe('failures-tests', () => {
     NDWFS.flag = false;
 
     const ndh = await reexecuteWorkflowById(wfidnds);
-    await expect(ndh!.getResult()).rejects.toThrow(DBOSUnexpectedStepError);
+    // Instanceof is not preserved by serialization, so we must assert the error code.
+    const err = await ndh.getResult().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(getDBOSErrorCode(err!)).toBe(UnexpectedStep);
   });
 
   test('non-deterministic-workflow-tx', async () => {
@@ -154,7 +306,29 @@ describe('failures-tests', () => {
     NDWFT.flag = false;
 
     const ndh = await reexecuteWorkflowById(wfidndt);
-    await expect(ndh!.getResult()).rejects.toThrow(DBOSUnexpectedStepError);
+    // Instanceof is not preserved by serialization, so we must assert the error code.
+    const err = await ndh.getResult().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(getDBOSErrorCode(err!)).toBe(UnexpectedStep);
+  });
+
+  test('non-deterministic-child-name', async () => {
+    const parentID = randomUUID();
+    NDWFChildName.flag = true;
+    await DBOS.withNextWorkflowID(parentID, async () => {
+      await expect(NDWFChildName.parent()).resolves.toBe('A');
+    });
+
+    // The replay starts a different child workflow at the position where childA was recorded.
+    NDWFChildName.flag = false;
+    const ndh = await reexecuteWorkflowById(parentID);
+    const err = await ndh.getResult().then(
+      () => undefined,
+      (e: Error) => e,
+    );
+    expect(getDBOSErrorCode(err!)).toBe(UnexpectedStep);
   });
 
   test('not launched', async () => {
@@ -192,6 +366,11 @@ class FailureTestClass extends ConfiguredInstance {
     return Promise.reject(err);
   }
 
+  @DBOS.workflow()
+  static async testStepWorkflow(code?: number) {
+    return FailureTestClass.testStep(code);
+  }
+
   @DBOS.step({ retriesAllowed: true, intervalSeconds: 1, maxAttempts: 2 })
   static async testFailStep() {
     FailureTestClass.cnt++;
@@ -201,10 +380,172 @@ class FailureTestClass extends ConfiguredInstance {
     return Promise.resolve(FailureTestClass.cnt);
   }
 
+  @DBOS.workflow()
+  static async testFailStepWorkflow() {
+    return FailureTestClass.testFailStep();
+  }
+
+  static sawStepContext = false;
+
+  // Reads no step context, so it is callable both inside and outside a workflow.
+  @DBOS.step({ retriesAllowed: true, intervalSeconds: 0, maxAttempts: 3 })
+  static async alwaysFailsStep() {
+    FailureTestClass.cnt++;
+    FailureTestClass.sawStepContext = DBOS.stepStatus !== undefined;
+    return Promise.reject(new Error('always fails'));
+  }
+
+  @DBOS.workflow()
+  static async alwaysFailsStepWorkflow() {
+    return FailureTestClass.alwaysFailsStep();
+  }
+
   @DBOS.step({ retriesAllowed: false })
   static async testNoRetry() {
     FailureTestClass.cnt++;
     return Promise.reject(new Error('failed no retry'));
+  }
+
+  @DBOS.workflow()
+  static async testNoRetryWF() {
+    return FailureTestClass.testNoRetry();
+  }
+
+  @DBOS.workflow()
+  static async testShouldRetryFalseRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('permanent'));
+      },
+      {
+        name: 'should-retry-false-run-step',
+        retriesAllowed: true,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => false,
+      },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testOrdinaryRetriedRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('temporary'));
+      },
+      { name: 'ordinary-retried-run-step', retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0 },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testShouldRetryTrueRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        if (FailureTestClass.cnt < 3) {
+          return Promise.reject(new Error('temporary'));
+        }
+        return Promise.resolve(FailureTestClass.cnt);
+      },
+      {
+        name: 'should-retry-true-run-step',
+        retriesAllowed: true,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => true,
+      },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testAsyncShouldRetryFalseRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('async permanent'));
+      },
+      {
+        name: 'async-should-retry-false-run-step',
+        retriesAllowed: true,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => Promise.resolve(false),
+      },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testThrowingShouldRetryRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('original'));
+      },
+      {
+        name: 'throwing-should-retry-run-step',
+        retriesAllowed: true,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => {
+          throw new Error('predicate failed');
+        },
+      },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testRejectingShouldRetryRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('original'));
+      },
+      {
+        name: 'rejecting-should-retry-run-step',
+        retriesAllowed: true,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => Promise.reject(new Error('predicate rejected')),
+      },
+    );
+  }
+
+  @DBOS.workflow()
+  static async testShouldRetryWithoutRetriesRunStep() {
+    return await DBOS.runStep(
+      () => {
+        FailureTestClass.cnt++;
+        return Promise.reject(new Error('no retries'));
+      },
+      {
+        name: 'should-retry-without-retries-run-step',
+        retriesAllowed: false,
+        maxAttempts: 3,
+        intervalSeconds: 0,
+        shouldRetry: () => {
+          FailureTestClass.success = 'shouldRetry called';
+          return true;
+        },
+      },
+    );
+  }
+
+  @DBOS.step({
+    retriesAllowed: true,
+    maxAttempts: 3,
+    intervalSeconds: 0,
+    shouldRetry: () => false,
+  })
+  static async testShouldRetryFalseDecoratedStep() {
+    FailureTestClass.cnt++;
+    return Promise.reject(new Error('decorated permanent'));
+  }
+
+  @DBOS.workflow()
+  static async testShouldRetryFalseDecoratedStepWorkflow() {
+    return await FailureTestClass.testShouldRetryFalseDecoratedStep();
   }
 
   static async noRegWorkflow2(code: number) {
@@ -253,5 +594,28 @@ class NDWFT {
   static async nondetWorkflow() {
     if (NDWFT.flag) return NDWFT.stepOne();
     return NDWFT.stepTwo();
+  }
+}
+
+// A parent that starts one of two child workflows, chosen by a flag the test flips between runs.
+class NDWFChildName {
+  static flag = true;
+
+  @DBOS.workflow()
+  static async childA() {
+    return Promise.resolve('A');
+  }
+
+  @DBOS.workflow()
+  static async childB() {
+    return Promise.resolve('B');
+  }
+
+  @DBOS.workflow()
+  static async parent() {
+    const h = NDWFChildName.flag
+      ? await DBOS.startWorkflow(NDWFChildName).childA()
+      : await DBOS.startWorkflow(NDWFChildName).childB();
+    return h.getResult();
   }
 }

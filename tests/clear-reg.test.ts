@@ -10,6 +10,8 @@ describe('clear-reg-tests', () => {
     DBOS.setConfig(config);
   });
 
+  const scheduleName = 'clear_reg_schedule';
+
   test('clear-reg-between-runs', async () => {
     for (let i = 1; i <= 2; ++i) {
       const stepfunc1 = DBOS.registerStep(async () => {
@@ -30,11 +32,17 @@ describe('clear-reg-tests', () => {
       const m = require(`./dynamic_code_v${i}`) as typeof import('./dynamic_code_v1'); // (Both source files have same interface)
 
       await DBOS.launch();
+      await DBOS.registerQueue(m.queue.name, { onConflict: 'always_update' });
+      await DBOS.createSchedule({
+        scheduleName,
+        workflowFn: m.DBOSWFTest.scheduledWF,
+        schedule: '* * * * * *',
+      });
       try {
         await expect(wf()).resolves.toBe(`${i}${i}`);
         const wfh = await DBOS.startWorkflow(wf)();
         expect(await wfh.getResult()).toBe(`${i}${i}`);
-        expect(await (await reexecuteWorkflowById(wfh.workflowID))!.getResult()).toBe(`${i}${i}`);
+        expect(await (await reexecuteWorkflowById(wfh.workflowID)).getResult()).toBe(`${i}${i}`);
         await expect(m.DBOSWFTest.runWF()).resolves.toBe(i === 1 ? 'A' : 'B');
         await expect(m.instA.doWorkflow()).resolves.toBe(i === 1 ? 'done A1' : 'done A2');
         await expect(m.instB.doWorkflow()).resolves.toBe('done B');
@@ -49,11 +57,12 @@ describe('clear-reg-tests', () => {
         // Wait for scheduled WF to run
         while (!m.DBOSWFTest.ran) await sleepms(100);
       } finally {
+        await DBOS.deleteSchedule(scheduleName);
         if (i === 2) {
           await DBOS.shutdown(); // 2 calls don't hurt
         }
         await DBOS.shutdown({ deregister: true });
       }
     }
-  }, 20000);
+  });
 });

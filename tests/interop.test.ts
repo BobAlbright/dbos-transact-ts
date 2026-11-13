@@ -13,8 +13,8 @@
  */
 
 import { Client } from 'pg';
-import { DBOS, DBOSClient, WorkflowQueue } from '../src';
-import { generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
+import { DBOS, DBOSClient } from '../src';
+import { generateDBOSTestConfig, setUpDBOSTestSysDb, testUnlessSharded } from './helpers';
 import { workflow_events, workflow_events_history, workflow_status, streams } from '../schemas/system_db_schema';
 import { DBOSConfig } from '../src/dbos-executor';
 import { z } from 'zod';
@@ -63,8 +63,6 @@ const CANONICAL_MESSAGE = { sender: 'test', payload: [1, 2, 3] };
 // ============================================================================
 // Canonical workflow registration
 // ============================================================================
-
-const _interopQueue = new WorkflowQueue('interopq');
 
 const _canonicalWorkflow = DBOS.registerWorkflow(
   async (
@@ -123,6 +121,7 @@ describe('interop-tests', () => {
     process.env.DBOS__APPVERSION = 'v0';
     await setUpDBOSTestSysDb(config);
     await DBOS.launch();
+    await DBOS.registerQueue('interopq', { onConflict: 'always_update' });
 
     systemDBClient = new Client({
       connectionString: config.systemDatabaseUrl,
@@ -176,11 +175,21 @@ describe('interop-tests', () => {
       expect(wsRow.name).toBe('canonicalWorkflow');
       expect(wsRow.class_name).toBe('interop');
 
+      // The payload tables are where a peer in another language reads these.
+      const wiResult = await systemDBClient.query<{ inputs: string }>(
+        'SELECT inputs FROM dbos.workflow_input WHERE workflow_uuid = $1',
+        [wfh.workflowID],
+      );
+      const woResult = await systemDBClient.query<{ output: string }>(
+        'SELECT output FROM dbos.workflow_output WHERE workflow_uuid = $1',
+        [wfh.workflowID],
+      );
+
       // Input string should actually match (no need for structural compare)
-      expect(wsRow.inputs).toBe(GOLDEN_INPUTS_JSON);
+      expect(wiResult.rows[0].inputs).toBe(GOLDEN_INPUTS_JSON);
 
       // Output: exact string comparison
-      expect(wsRow.output).toBe(GOLDEN_OUTPUT_JSON);
+      expect(woResult.rows[0].output).toBe(GOLDEN_OUTPUT_JSON);
 
       // workflow_events: exact string comparison
       const evtResult = await systemDBClient.query<workflow_events>(
@@ -218,7 +227,8 @@ describe('interop-tests', () => {
   // Test: Direct-insert replay (proves cross-language compatibility)
   // --------------------------------------------------------------------------
 
-  test('test-interop-direct-insert', async () => {
+  // Writes core's unkeyed tables directly.
+  testUnlessSharded('test-interop-direct-insert', async () => {
     const id = `interop-di-${Date.now()}`;
 
     // Insert golden workflow_status

@@ -5,10 +5,35 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-require-imports */
 import type { Span } from '@opentelemetry/sdk-trace-base';
-import type { SpanContext } from '@opentelemetry/api';
 import { TelemetryCollector } from './collector';
 import { globalParams } from '../utils';
 import type { BasicTracerProvider as BasicTracerProviderType } from '@opentelemetry/sdk-trace-base';
+import type { OtelAttributeFormat } from '../dbos-executor';
+
+// Legacy DBOS attribute name -> OpenTelemetry semconv-style equivalent.
+// Names align with `dbos-transact-py` (Python SDK) so the two SDKs converge
+// on the same attribute schema once `otelAttributeFormat: 'semconv'` is
+// selected on both sides.
+//
+// `startSpan` sweeps the supplied attributes dict
+// through `resolveAttributeName`, so call sites can pass legacy DBOS keys
+// directly and have them remapped automatically when
+// `otelAttributeFormat === 'semconv'`. Keys not in this table pass through
+// unchanged. `endSpan` does the same for the few attributes it sets after
+// the span has been created. This mirrors the equivalent loop in
+// `dbos-transact-py`'s `start_span`.
+const LEGACY_TO_SEMCONV: Readonly<Record<string, string>> = {
+  operationUUID: 'dbos.operation.workflow_id',
+  operationType: 'dbos.operation.type',
+  operationName: 'dbos.operation.name',
+  applicationID: 'dbos.application.id',
+  applicationVersion: 'dbos.application.version',
+  executorID: 'dbos.executor.id',
+  queueName: 'dbos.queue.name',
+  authenticatedUser: 'dbos.user.name',
+  authenticatedRoles: 'dbos.user.roles',
+  assumedRole: 'dbos.user.assumed_role',
+};
 
 // As DBOS OTLP is optional, OTLP objects must only be dynamically imported
 // and only when OTLP is enabled. Importing OTLP types is fine as long
@@ -77,7 +102,7 @@ class StubSpan implements DBOSSpan {
 }
 
 export function runWithTrace<R>(span: DBOSSpan, func: () => Promise<R>): Promise<R> {
-  if (!globalParams.enableOTLP) {
+  if (!globalParams.tracingEnabled) {
     return func();
   }
   const { context, trace } = require('@opentelemetry/api');
@@ -85,7 +110,7 @@ export function runWithTrace<R>(span: DBOSSpan, func: () => Promise<R>): Promise
 }
 
 export function getActiveSpan() {
-  if (!globalParams.enableOTLP) {
+  if (!globalParams.tracingEnabled) {
     return undefined;
   }
   const { trace } = require('@opentelemetry/api');
@@ -93,7 +118,7 @@ export function getActiveSpan() {
 }
 
 export function isTraceContextWorking(): boolean {
-  if (!globalParams.enableOTLP) {
+  if (!globalParams.tracingEnabled) {
     return false;
   }
   const { context, trace } = require('@opentelemetry/api');
@@ -110,17 +135,18 @@ export function isTraceContextWorking(): boolean {
 }
 
 export function installTraceContextManager(appName: string = 'dbos'): void {
-  if (!globalParams.enableOTLP) {
+  if (!globalParams.tracingEnabled) {
     return;
   }
   const { AsyncLocalStorageContextManager } = require('@opentelemetry/context-async-hooks');
   const { context, trace } = require('@opentelemetry/api');
   const { BasicTracerProvider } = require('@opentelemetry/sdk-trace-base');
 
+  // setGlobalTracerProvider and setGlobalContextManager are "first one wins."
+  // If an external provider is already registered, these calls are safely ignored.
   const contextManager = new AsyncLocalStorageContextManager();
   contextManager.enable();
   context.setGlobalContextManager(contextManager);
-
   const provider: BasicTracerProviderType = new BasicTracerProvider({
     resource: {
       attributes: {
@@ -134,40 +160,47 @@ export function installTraceContextManager(appName: string = 'dbos'): void {
 export class Tracer {
   readonly applicationID: string;
   readonly executorID: string;
+  private readonly otelAttributeFormat: OtelAttributeFormat;
+
   constructor(
     private readonly telemetryCollector: TelemetryCollector,
-    appName: string = 'dbos',
+    otelAttributeFormat: OtelAttributeFormat,
   ) {
     this.applicationID = globalParams.appID;
-    this.executorID = globalParams.executorID; // for consistency with src/context.ts
-    if (!globalParams.enableOTLP) {
-      return;
-    }
-    const { trace } = require('@opentelemetry/api');
-    const { BasicTracerProvider } = require('@opentelemetry/sdk-trace-base');
-
-    const tracer: BasicTracerProviderType = new BasicTracerProvider({
-      resource: {
-        attributes: {
-          'service.name': appName,
-        },
-      },
-    });
-    trace.setGlobalTracerProvider(tracer);
+    this.executorID = globalParams.executorID;
+    this.otelAttributeFormat = otelAttributeFormat;
   }
 
-  startSpanWithContext(spanContext: unknown, name: string, attributes?: Attributes): DBOSSpan {
-    if (!globalParams.enableOTLP) {
-      return new StubSpan();
+  /**
+   * Map a legacy DBOS attribute name to the name that should be emitted on
+   * the span, per `otelAttributeFormat`. Returns the original key for
+   * unknown attributes.
+   *
+   * Attributes passed into `startSpan` are remapped
+   * automatically via this method, so call sites don't need to invoke it
+   * directly. Exposed for code paths that write attributes after span
+   * creation (e.g. `endSpan`, ad-hoc `setAttribute` calls).
+   */
+  resolveAttributeName(key: string): string {
+    if (this.otelAttributeFormat === 'semconv') {
+      return LEGACY_TO_SEMCONV[key] ?? key;
     }
-    const opentelemetry = require('@opentelemetry/api');
-    const tracer = opentelemetry.trace.getTracer('dbos-tracer');
-    const ctx = opentelemetry.trace.setSpanContext(opentelemetry.context.active(), spanContext as SpanContext);
-    return tracer.startSpan(name, { startTime: performance.now(), attributes: attributes }, ctx) as Span;
+    return key;
+  }
+
+  private remapAttributes(attributes?: Attributes): Attributes | undefined {
+    if (!attributes || this.otelAttributeFormat !== 'semconv') {
+      return attributes;
+    }
+    const remapped: Attributes = {};
+    for (const [k, v] of Object.entries(attributes)) {
+      remapped[LEGACY_TO_SEMCONV[k] ?? k] = v;
+    }
+    return remapped;
   }
 
   startSpan(name: string, attributes?: Attributes, inputSpan?: DBOSSpan): DBOSSpan {
-    if (!globalParams.enableOTLP) {
+    if (!globalParams.tracingEnabled) {
       return new StubSpan();
     }
     const parentSpan = inputSpan as Span;
@@ -175,28 +208,34 @@ export class Tracer {
     const { hrTime } = require('@opentelemetry/core');
     const tracer = opentelemetry.trace.getTracer('dbos-tracer');
     const startTime = hrTime(performance.now());
+    const remapped = this.remapAttributes(attributes);
     if (parentSpan) {
       const ctx = opentelemetry.trace.setSpan(opentelemetry.context.active(), parentSpan);
-      return tracer.startSpan(name, { startTime: startTime, attributes: attributes }, ctx) as Span;
+      return tracer.startSpan(name, { startTime: startTime, attributes: remapped }, ctx) as Span;
     } else {
-      return tracer.startSpan(name, { startTime: startTime, attributes: attributes }) as Span;
+      return tracer.startSpan(name, { startTime: startTime, attributes: remapped }) as Span;
     }
   }
 
   endSpan(inputSpan: DBOSSpan) {
-    if (!globalParams.enableOTLP) {
+    if (!globalParams.tracingEnabled) {
       return;
     }
     const { hrTime } = require('@opentelemetry/core');
     const span = inputSpan as Span;
     span.setAttributes({
-      applicationID: this.applicationID,
-      applicationVersion: globalParams.appVersion,
+      [this.resolveAttributeName('applicationID')]: this.applicationID,
+      [this.resolveAttributeName('applicationVersion')]: globalParams.appVersion,
     });
-    if (span.attributes && !('executorID' in span.attributes)) {
-      span.setAttribute('executorID', this.executorID);
+    const executorIDKey = this.resolveAttributeName('executorID');
+    if (span.attributes && !(executorIDKey in span.attributes)) {
+      span.setAttribute(executorIDKey, this.executorID);
     }
     span.end(hrTime(performance.now()));
-    this.telemetryCollector.push(span);
+    // Only push to DBOS's own collector when DBOS manages export.
+    // When an external TracerProvider is used, span.end() triggers its processors.
+    if (globalParams.enableOTLP) {
+      this.telemetryCollector.push(span);
+    }
   }
 }

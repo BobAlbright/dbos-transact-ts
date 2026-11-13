@@ -1,20 +1,29 @@
-import { GetWorkflowsInput, StatusString, DBOS, DBOSClient, WorkflowQueue } from '../src';
+import { GetWorkflowsInput, StatusString, DBOS, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import {
   generateDBOSTestConfig,
   setUpDBOSTestSysDb,
   Event,
+  queueEntriesAreCleanedUp,
   recoverPendingWorkflows,
   reexecuteWorkflowById,
+  testUnlessSharded,
+  usingSharding,
 } from './helpers';
 import { Client } from 'pg';
 import { WorkflowHandle, WorkflowStatus } from '../src/workflow';
 import { randomUUID } from 'node:crypto';
-import { globalParams, sleepms } from '../src/utils';
-import { SystemDatabase } from '../src/system_database';
+import { setTimeout as abortableSleep } from 'node:timers/promises';
+import { dbRetryConfig, globalParams, sleepms } from '../src/utils';
+import { createSystemDatabase, SystemDatabase } from '../src/system_database';
 import { GlobalLogger } from '../src/telemetry/logs';
-import { getWorkflow, globalTimeout, listQueuedWorkflows, listWorkflows } from '../src/workflow_management';
-import { DBOSAwaitedWorkflowCancelledError, DBOSWorkflowCancelledError } from '../src/error';
+import { getWorkflow, listQueuedWorkflows, listWorkflows } from '../src/workflow_management';
+import {
+  DBOSAwaitedWorkflowCancelledError,
+  DBOSNonExistentWorkflowError,
+  DBOSStepTimeoutError,
+  DBOSWorkflowCancelledError,
+} from '../src/error';
 import assert from 'node:assert';
 import { DBOSJSON } from '../src/serialization';
 
@@ -249,7 +258,12 @@ describe('workflow-management-tests', () => {
 
     const logger = new GlobalLogger();
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
+    const sysdb = createSystemDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      logger,
+      serializer: DBOSJSON,
+      sharding: usingSharding(),
+    });
     try {
       const input: GetWorkflowsInput = {};
       const infos = await listWorkflows(sysdb, input);
@@ -339,6 +353,12 @@ describe('workflow-management-tests', () => {
   test('test-cancel-retry-restart', async () => {
     TestEndpoints.tries = 0;
 
+    // A blocked workflow observes cancellation on its next poll, not instantly. Shorten the
+    // poll interval so the cancelled recv below stops promptly (the launch in beforeEach builds
+    // a fresh system database, so this does not leak to other tests).
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    sysdb.dbPollingIntervalEventMs = 100;
+
     const workflowID = `test-cancel-resume-fork-${Date.now()}`;
     const handle = await DBOS.startWorkflow(TestEndpoints, { workflowID }).waitingWorkflow(42);
     expect(TestEndpoints.tries).toBe(1);
@@ -353,6 +373,13 @@ describe('workflow-management-tests', () => {
     );
     expect(result.rows[0].attempts).toBe(String(1));
     expect(result.rows[0].status).toBe(StatusString.CANCELLED);
+
+    // Wait for the cancelled execution to fully stop before resuming. Otherwise the stale
+    // coroutine (still blocked in recv) could consume the message and complete the workflow
+    // itself, instead of the fresh execution that resume is meant to start.
+    while (sysdb.checkForRunningWorkflow(workflowID)) {
+      await sleepms(50);
+    }
 
     await recoverPendingWorkflows(); // Does nothing as the workflow is CANCELLED
     expect(TestEndpoints.tries).toBe(1);
@@ -370,8 +397,7 @@ describe('workflow-management-tests', () => {
     expect(TestEndpoints.tries).toBe(2);
     expect(result.rows[0].status).toBe(StatusString.SUCCESS);
 
-    // Resume a non-existent workflow is a no-op (bulk UPDATE affects 0 rows)
-    await DBOS.resumeWorkflow('fake-workflow');
+    await expect(DBOS.resumeWorkflow('fake-workflow')).rejects.toThrow(DBOSNonExistentWorkflowError);
 
     // fork the workflow
     const wfh = await DBOS.forkWorkflow(workflowID, 0);
@@ -394,7 +420,184 @@ describe('workflow-management-tests', () => {
     );
     // expect(result.rows[0].attempts).toBe(String(1));
     expect(result.rows[0].status).toBe(StatusString.SUCCESS);
-  }, 30000);
+  });
+
+  test('test-resume-nonexistent-workflow', async () => {
+    const missingID = randomUUID();
+
+    // Resuming a missing ID must fail, not return a handle whose getResult() polls forever
+    await expect(DBOS.resumeWorkflow(missingID)).rejects.toThrow(DBOSNonExistentWorkflowError);
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      await expect(client.resumeWorkflow(missingID)).rejects.toThrow(DBOSNonExistentWorkflowError);
+
+      // Resuming a workflow that exists but already completed is still a legal no-op
+      const wfid = randomUUID();
+      await DBOS.withNextWorkflowID(wfid, () => simpleResumeWorkflow(5));
+      await expect((await DBOS.resumeWorkflow<number>(wfid)).getResult()).resolves.toBe(5);
+      await expect((await client.resumeWorkflow<number>(wfid)).getResult()).resolves.toBe(5);
+
+      // A bulk resume containing a missing ID is all-or-nothing: nothing is re-enqueued
+      await expect(DBOS.resumeWorkflows([wfid, missingID])).rejects.toThrow(DBOSNonExistentWorkflowError);
+      await expect(client.resumeWorkflows([wfid, missingID])).rejects.toThrow(DBOSNonExistentWorkflowError);
+      expect((await DBOS.getWorkflowStatus(wfid))?.status).toBe(StatusString.SUCCESS);
+    } finally {
+      await client.destroy();
+    }
+  });
+
+  test('test-cancel-after-final-step', async () => {
+    // A workflow cancelled after its final step completes (but before it
+    // finishes) must not be able to complete successfully. CANCELLED is terminal.
+    TestEndpoints.stepsCompleted = 0;
+    const input = 5;
+    const wfid = randomUUID();
+
+    const cancelledHandle = await DBOS.startWorkflow(TestEndpoints, { workflowID: wfid }).cancelAfterFinalStepWorkflow(
+      input,
+    );
+    await TestEndpoints.mainThreadEvent.wait();
+    await DBOS.cancelWorkflow(wfid);
+    TestEndpoints.workflowEvent.set();
+
+    // The workflow must not complete successfully.
+    await expect(cancelledHandle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
+    expect(TestEndpoints.stepsCompleted).toBe(1);
+    await expect(DBOS.getWorkflowStatus(wfid)).resolves.toMatchObject({ status: StatusString.CANCELLED });
+
+    // Resuming it should let it complete successfully.
+    const handle = await DBOS.resumeWorkflow<number>(wfid);
+    await expect(handle.getResult()).resolves.toBe(input);
+    await expect(DBOS.getWorkflowStatus(wfid)).resolves.toMatchObject({ status: StatusString.SUCCESS });
+    expect(TestEndpoints.stepsCompleted).toBe(1); // cancelStep was already recorded, not re-run
+  });
+
+  test('test-resumed-dispatch-runs-alongside-a-stale-run', async () => {
+    // A resume that lands while run 1's stale outcome write is still in flight:
+    // this same executor dequeues the resumed workflow and must run it to
+    // completion alongside the stale run, which parks once its write is refused.
+    TestEndpoints.staleWriteRuns = 0;
+    TestEndpoints.staleWriteEntered.clear();
+    TestEndpoints.staleWriteReleaseRun1.clear();
+    TestEndpoints.staleWriteSecondRunDone.clear();
+
+    const wfid = randomUUID();
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+
+    const parked = new Event();
+    const releaseStaleWrite = new Event();
+    let parkedOnce = false;
+
+    const originalRecordOutput = sysdb.recordWorkflowOutput.bind(sysdb);
+    sysdb.recordWorkflowOutput = async (...fnargs: Parameters<SystemDatabase['recordWorkflowOutput']>) => {
+      if (fnargs[0] === wfid && !parkedOnce) {
+        parkedOnce = true;
+        parked.set();
+        await releaseStaleWrite.wait();
+      }
+      return originalRecordOutput(...fnargs);
+    };
+
+    try {
+      await DBOS.startWorkflow(TestEndpoints, { workflowID: wfid }).staleWriteBlockingWorkflow();
+      await TestEndpoints.staleWriteEntered.wait();
+
+      await DBOS.cancelWorkflow(wfid);
+
+      // Run 1 returns; its stale outcome write is held in flight here.
+      TestEndpoints.staleWriteReleaseRun1.set();
+      await parked.wait();
+      await expect(DBOS.getWorkflowStatus(wfid)).resolves.toMatchObject({ status: StatusString.CANCELLED });
+
+      const resumedHandle = await DBOS.resumeWorkflow<string>(wfid);
+
+      // While the stale write is still parked, the resumed workflow must be
+      // dequeued and executed by this same executor.
+      let timer: NodeJS.Timeout | undefined;
+      const blocked = await Promise.race([
+        TestEndpoints.staleWriteSecondRunDone.wait().then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), 15000);
+        }),
+      ]);
+      clearTimeout(timer);
+      expect(blocked).toBe(false); // the stale run did not block the resumed dispatch
+
+      await expect(resumedHandle.getResult()).resolves.toBe('completed');
+      expect(TestEndpoints.staleWriteRuns).toBe(2);
+    } finally {
+      releaseStaleWrite.set();
+      sysdb.recordWorkflowOutput = originalRecordOutput;
+    }
+  });
+
+  test('getworkflows-with-completed-at', async () => {
+    // Successful workflow gets completedAt set.
+    const beforeSuccess = new Date().toISOString();
+    await expect(TestEndpoints.testWorkflow('alice')).resolves.toBe('alice');
+    // Tight window: stop here so subsequent workflows complete outside it.
+    await sleepms(50);
+    const afterSuccess = new Date().toISOString();
+    await sleepms(50);
+
+    const successList = await DBOS.listWorkflows({ workflowName: 'testWorkflow' });
+    expect(successList.length).toBe(1);
+    const successStatus = successList[0];
+    expect(successStatus.status).toBe(StatusString.SUCCESS);
+    expect(successStatus.completedAt).toBeDefined();
+    expect(successStatus.completedAt!).toBeGreaterThanOrEqual(successStatus.createdAt);
+
+    // Errored workflow gets completedAt set.
+    await expect(TestEndpoints.failWorkflow('bob')).rejects.toThrow();
+    const errorList = await DBOS.listWorkflows({ workflowName: 'failWorkflow' });
+    expect(errorList.length).toBe(1);
+    const errorStatus = errorList[0];
+    expect(errorStatus.status).toBe(StatusString.ERROR);
+    expect(errorStatus.completedAt).toBeDefined();
+
+    // Cancelled workflow gets completedAt set; resumed workflow clears it.
+    const cancelID = randomUUID();
+    const cancelledHandle = await DBOS.startWorkflow(TestEndpoints, { workflowID: cancelID }).waitingWorkflow(42);
+    await DBOS.cancelWorkflow(cancelID);
+    const cancelled = await DBOS.getWorkflowStatus(cancelID);
+    expect(cancelled).toBeDefined();
+    expect(cancelled!.status).toBe(StatusString.CANCELLED);
+    expect(cancelled!.completedAt).toBeDefined();
+
+    const resumedHandle = await DBOS.resumeWorkflow<string>(cancelID);
+    const resumed = await DBOS.getWorkflowStatus(cancelID);
+    expect(resumed).toBeDefined();
+    expect(resumed!.completedAt).toBeUndefined();
+
+    // completedAfter / completedBefore only match terminal workflows in range.
+    const inRange = await DBOS.listWorkflows({
+      completedAfter: beforeSuccess,
+      completedBefore: afterSuccess,
+    });
+    const idsInRange = new Set(inRange.map((w) => w.workflowID));
+    expect(idsInRange.has(successStatus.workflowID)).toBe(true);
+    // The error and resumed-pending workflows complete outside this window.
+    expect(idsInRange.has(errorStatus.workflowID)).toBe(false);
+    expect(idsInRange.has(cancelID)).toBe(false);
+
+    // completedAfter alone excludes never-completed workflows.
+    const onlyCompleted = await DBOS.listWorkflows({ completedAfter: beforeSuccess });
+    const completedIds = new Set(onlyCompleted.map((w) => w.workflowID));
+    expect(completedIds.has(successStatus.workflowID)).toBe(true);
+    expect(completedIds.has(errorStatus.workflowID)).toBe(true);
+    expect(completedIds.has(cancelID)).toBe(false);
+
+    // A window before any work happened matches nothing.
+    const farPast = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const noneYet = await DBOS.listWorkflows({ completedBefore: farPast });
+    expect(noneYet.length).toBe(0);
+
+    // Release the resumed workflow and wait for it to finish.
+    await DBOS.send(cancelID, 'message');
+    await expect(resumedHandle.getResult()).resolves.toEqual(`42-message`);
+    // Suppress unused-variable lint for cancelledHandle.
+    expect(cancelledHandle.workflowID).toBe(cancelID);
+  });
 
   test('systemdb-migration-backward-compatible', async () => {
     // Make sure the system DB migration failure is handled correctly.
@@ -410,6 +613,119 @@ describe('workflow-management-tests', () => {
     await systemDBClient.query(`UPDATE "dbos"."dbos_migrations" SET "version" = 0;`);
     await DBOS.launch();
     await expect(TestEndpoints.testWorkflow('alice')).resolves.toBe('alice');
+  });
+
+  const simpleResumeWorkflow = DBOS.registerWorkflow(async (x: number) => Promise.resolve(x), {
+    name: 'simpleResumeWorkflow',
+  });
+
+  const forkTargetWorkflow = DBOS.registerWorkflow(async (x: number) => Promise.resolve(x), {
+    name: 'forkTargetWorkflow',
+  });
+  const forkMaybeMissingWorkflow = DBOS.registerWorkflow(
+    async (targetID: string) => {
+      try {
+        await DBOS.forkWorkflow(targetID, 1);
+      } catch {
+        return 'missing';
+      }
+      return 'forked';
+    },
+    { name: 'forkMaybeMissingWorkflow' },
+  );
+
+  test('fork-nonexistent-workflow-replays-recorded-error', async () => {
+    const missingID = randomUUID();
+    const handle = await DBOS.startWorkflow(forkMaybeMissingWorkflow)(missingID);
+    await expect(handle.getResult()).resolves.toBe('missing');
+    const steps = await DBOS.listWorkflowSteps(handle.workflowID);
+    expect(steps?.map((s) => s.name)).toEqual(['DBOS.forkWorkflow']);
+    expect(steps![0].error?.message).toContain(missingID);
+
+    // Once the target exists, a replay still takes the recorded branch and forks nothing.
+    await DBOS.withNextWorkflowID(missingID, () => forkTargetWorkflow(1));
+    const replayed = await reexecuteWorkflowById(handle.workflowID);
+    await expect(replayed.getResult()).resolves.toBe('missing');
+    expect(await DBOS.listWorkflows({ forkedFrom: missingID })).toEqual([]);
+  });
+
+  const failingChildWorkflow = DBOS.registerWorkflow(
+    async () => {
+      await Promise.resolve();
+      throw new Error('child failed');
+    },
+    { name: 'failingChildWorkflow' },
+  );
+  const awaitFailingChildWorkflow = DBOS.registerWorkflow(
+    async (childID: string) => {
+      try {
+        await DBOS.getResult(childID);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      return 'succeeded';
+    },
+    { name: 'awaitFailingChildWorkflow' },
+  );
+
+  test('get-result-replays-recorded-error', async () => {
+    const childID = randomUUID();
+    const childHandle = await DBOS.startWorkflow(failingChildWorkflow, { workflowID: childID })();
+    await expect(childHandle.getResult()).rejects.toThrow('child failed');
+
+    const handle = await DBOS.startWorkflow(awaitFailingChildWorkflow)(childID);
+    await expect(handle.getResult()).resolves.toBe('child failed');
+    const steps = await DBOS.listWorkflowSteps(handle.workflowID);
+    expect(steps![0].error?.message).toBe('child failed');
+
+    // The replay re-throws the recorded error rather than awaiting the now-deleted child.
+    await DBOS.deleteWorkflow(childID);
+    const replayed = await reexecuteWorkflowById(handle.workflowID);
+    await expect(replayed.getResult()).resolves.toBe('child failed');
+  });
+
+  const cancelWithChildrenWorkflow = DBOS.registerWorkflow(
+    async (targetID: string) => {
+      await DBOS.cancelWorkflow(targetID, { cancelChildren: true });
+    },
+    { name: 'cancelWithChildrenWorkflow' },
+  );
+
+  // Fails core's child lookup by parent ID, which a sharded system database replaces.
+  testUnlessSharded('workflow-command-transient-error-is-retried-not-recorded', async () => {
+    const savedBackoff = { ...dbRetryConfig };
+    dbRetryConfig.initialBackoffSec = 0.05;
+    const targetID = randomUUID();
+    const pool = DBOSExecutor.globalInstance!.systemDatabase.pool;
+    const originalQuery = pool.query.bind(pool) as (text: unknown, params?: unknown) => Promise<unknown>;
+    let calls = 0;
+    // Fail the first child lookup for the target with a connection error.
+    const spy = jest.spyOn(pool, 'query').mockImplementation(((text: unknown, params?: unknown) => {
+      const ids = Array.isArray(params) ? (params[0] as unknown) : undefined;
+      if (
+        typeof text === 'string' &&
+        text.includes('parent_workflow_id = ANY') &&
+        Array.isArray(ids) &&
+        ids.includes(targetID)
+      ) {
+        calls += 1;
+        if (calls === 1) {
+          return Promise.reject(Object.assign(new Error('connection lost'), { code: 'ECONNRESET' }));
+        }
+      }
+      return originalQuery(text, params);
+    }) as never);
+    try {
+      const handle = await DBOS.startWorkflow(cancelWithChildrenWorkflow)(targetID);
+      await handle.getResult();
+      expect(calls).toBe(2);
+      const steps = await DBOS.listWorkflowSteps(handle.workflowID);
+      expect(steps?.map((s) => s.name)).toEqual(['DBOS.cancelWorkflow']);
+      expect(steps![0].error).toBeNull();
+    } finally {
+      spy.mockRestore();
+      Object.assign(dbRetryConfig, savedBackoff);
+    }
   });
 
   class TestEndpoints {
@@ -447,11 +763,50 @@ describe('workflow-management-tests', () => {
     static async stepOne() {
       return Promise.resolve();
     }
+
+    static stepsCompleted = 0;
+    static workflowEvent = new Event();
+    static mainThreadEvent = new Event();
+
+    @DBOS.step()
+    static async cancelStep() {
+      TestEndpoints.stepsCompleted += 1;
+      return Promise.resolve();
+    }
+
+    @DBOS.workflow()
+    static async cancelAfterFinalStepWorkflow(x: number) {
+      // The only step runs and records its output...
+      await TestEndpoints.cancelStep();
+      // ...then the workflow is cancelled before it returns.
+      TestEndpoints.mainThreadEvent.set();
+      await TestEndpoints.workflowEvent.wait();
+      return x;
+    }
+
+    static staleWriteRuns = 0;
+    static staleWriteEntered = new Event();
+    static staleWriteReleaseRun1 = new Event();
+    static staleWriteSecondRunDone = new Event();
+
+    @DBOS.workflow()
+    static async staleWriteBlockingWorkflow() {
+      TestEndpoints.staleWriteRuns += 1;
+      if (TestEndpoints.staleWriteRuns === 1) {
+        TestEndpoints.staleWriteEntered.set();
+        await TestEndpoints.staleWriteReleaseRun1.wait();
+        return '';
+      }
+      TestEndpoints.staleWriteSecondRunDone.set();
+      return 'completed';
+    }
   }
 });
 
 describe('test-list-queues', () => {
   let config: DBOSConfig;
+  // The retention tests below read the payload tables directly.
+  let systemDBClient: Client;
 
   beforeAll(async () => {
     config = generateDBOSTestConfig();
@@ -461,17 +816,22 @@ describe('test-list-queues', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
+    await DBOS.registerQueue(TestListQueues.queue.name, { onConflict: 'always_update' });
+    await DBOS.registerQueue(TestGarbageCollection.queue.name, { onConflict: 'always_update' });
+    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
+    await systemDBClient.connect();
   });
 
   afterEach(async () => {
+    await systemDBClient.end();
     await DBOS.shutdown();
-  }, 20000);
+  });
 
   class TestListQueues {
     static queuedSteps = 5;
     static event = new Event();
     static taskEvents = Array.from({ length: TestListQueues.queuedSteps }, () => new Event());
-    static queue = new WorkflowQueue('testQueueRecovery');
+    static queue = { name: 'testQueueRecovery' };
 
     @DBOS.workflow()
     static async testWorkflow() {
@@ -502,7 +862,12 @@ describe('test-list-queues', () => {
 
     const logger = new GlobalLogger();
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
+    const sysdb = createSystemDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      logger,
+      serializer: DBOSJSON,
+      sharding: usingSharding(),
+    });
     try {
       let input: GetWorkflowsInput = {};
       let output: WorkflowStatus[] = [];
@@ -658,6 +1023,7 @@ describe('test-list-queues', () => {
 
   class TestGarbageCollection {
     static event = new Event();
+    static readonly queue = { name: 'gc-test-queue' };
 
     @DBOS.step()
     static async testStep(x: number) {
@@ -672,94 +1038,93 @@ describe('test-list-queues', () => {
 
     @DBOS.workflow()
     static async blockedWorkflow() {
+      // A recorded step, so what the sweep spares covers the checkpoints a replay would
+      // read and not only the inputs.
+      await TestGarbageCollection.testStep(0);
       await TestGarbageCollection.event.wait();
       return DBOS.workflowID;
     }
-  }
-
-  test('test-garbage-collection', async () => {
-    const numWorkflows = 10;
-
-    // Start one blocked workflow and 100 normal workflows
-    const handle = await DBOS.startWorkflow(TestGarbageCollection).blockedWorkflow();
-    for (let i = 0; i < numWorkflows; i++) {
-      await expect(TestGarbageCollection.testWorkflow(i)).resolves.toBe(i);
-    }
-
-    // Garbage collect all but one workflow
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(undefined, 1);
-    // Verify two workflows remain: the newest and blocked workflow
-    let workflows = await DBOS.listWorkflows({});
-    expect(workflows.length).toBe(2);
-    expect(workflows[0].workflowID).toEqual(handle.workflowID);
-
-    // Garbage collect all completed workflows
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(Date.now(), undefined);
-    // Verify only the blocked workflow remains
-    workflows = await DBOS.listWorkflows({});
-    expect(workflows.length).toBe(1);
-    expect(workflows[0].workflowID).toEqual(handle.workflowID);
-
-    // Finish the blocked workflow, garbage collect everything
-    TestGarbageCollection.event.set();
-    await expect(handle.getResult()).resolves.toBeTruthy();
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(Date.now(), undefined);
-    workflows = await DBOS.listWorkflows({});
-    expect(workflows.length).toBe(0);
-
-    // Verify GC runs without errors on a blank table
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(undefined, 1);
-
-    // Run workflows, wait, run them again
-    for (let i = 0; i < numWorkflows; i++) {
-      await expect(TestGarbageCollection.testWorkflow(i)).resolves.toBe(i);
-    }
-    await sleepms(1000);
-    for (let i = 0; i < numWorkflows; i++) {
-      await expect(TestGarbageCollection.testWorkflow(i)).resolves.toBe(i);
-    }
-    // GC the first half, verify only half were GC'ed
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(Date.now() - 1000, undefined);
-    workflows = await DBOS.listWorkflows({});
-    expect(workflows.length).toBe(numWorkflows);
-  });
-
-  class TestGlobalTimeout {
-    static blocked: boolean = true;
 
     @DBOS.workflow()
-    static async blockedWorkflow() {
-      while (TestGlobalTimeout.blocked) {
-        await DBOS.sleep(100);
-      }
-      return DBOS.workflowID as string;
+    static async gcQueuedWorkflow() {
+      await Promise.resolve();
+    }
+  }
+});
+
+describe('legacy-payload-rows', () => {
+  let config: DBOSConfig;
+  let systemDBClient: Client;
+
+  class LegacyPayload {
+    @DBOS.workflow()
+    static async workflow(x: number) {
+      return Promise.resolve(x);
     }
   }
 
-  test('test-global-timeout', async () => {
-    const numWorkflows = 10;
-    const handles: WorkflowHandle<string>[] = [];
-    for (let i = 0; i < numWorkflows; i++) {
-      handles.push(await DBOS.startWorkflow(TestGlobalTimeout).blockedWorkflow());
-    }
+  beforeAll(async () => {
+    config = generateDBOSTestConfig();
+    await setUpDBOSTestSysDb(config);
+    DBOS.setConfig(config);
+  });
 
-    // Wait one second, start one final workflow, then timeout all workflows started more than one second ago
-    await sleepms(1000);
-    const finalHandle = await DBOS.startWorkflow(TestGlobalTimeout).blockedWorkflow();
-    await globalTimeout(DBOSExecutor.globalInstance?.systemDatabase as SystemDatabase, Date.now() - 1000);
+  beforeEach(async () => {
+    await DBOS.launch();
+    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
+    await systemDBClient.connect();
+  });
 
-    // Verify all workflows started before the global timeout are cancelled
-    for (const handle of handles) {
-      await expect(handle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
-    }
-    TestGlobalTimeout.blocked = false;
-    await expect(finalHandle.getResult()).resolves.toBeTruthy();
+  afterEach(async () => {
+    await systemDBClient.end();
+    await DBOS.shutdown();
+  });
+
+  test('test-legacy-payload-rows-still-read', async () => {
+    await expect(LegacyPayload.workflow(11)).resolves.toBe(11);
+    const workflowID = (await DBOS.listWorkflows({}))[0].workflowID;
+
+    const legacy = await systemDBClient.query<{ inputs: string | null; output: string | null }>(
+      `SELECT inputs, output FROM dbos.workflow_status WHERE workflow_uuid = $1`,
+      [workflowID],
+    );
+    const split = await systemDBClient.query<{ inputs: string }>(
+      `SELECT inputs FROM dbos.workflow_input WHERE workflow_uuid = $1`,
+      [workflowID],
+    );
+    const out = await systemDBClient.query<{ output: string }>(
+      `SELECT output FROM dbos.workflow_output WHERE workflow_uuid = $1`,
+      [workflowID],
+    );
+
+    // Payloads land only in their own tables, so the legacy columns stay empty.
+    expect(legacy.rows[0].inputs).toBeNull();
+    expect(legacy.rows[0].output).toBeNull();
+    expect(split.rows[0].inputs).not.toBeNull();
+    expect(out.rows[0].output).not.toBeNull();
+
+    // Move them onto the legacy columns: a row written before the split looks exactly like
+    // this, and every read path must still resolve it from workflow_status.
+    await systemDBClient.query(`UPDATE dbos.workflow_status SET inputs = $2, output = $3 WHERE workflow_uuid = $1`, [
+      workflowID,
+      split.rows[0].inputs,
+      out.rows[0].output,
+    ]);
+    await systemDBClient.query(`DELETE FROM dbos.workflow_input WHERE workflow_uuid = $1`, [workflowID]);
+    await systemDBClient.query(`DELETE FROM dbos.workflow_output WHERE workflow_uuid = $1`, [workflowID]);
+
+    const listed = (await DBOS.listWorkflows({ workflowIDs: [workflowID] }))[0];
+    expect(listed.input).toEqual([11]);
+    expect(listed.output).toBe(11);
+    await expect(DBOS.retrieveWorkflow(workflowID).getResult()).resolves.toBe(11);
+    const forked = await DBOS.forkWorkflow(workflowID, 0);
+    await expect(forked.getResult()).resolves.toBe(11);
   });
 });
 
 describe('test-list-steps', () => {
   let config: DBOSConfig;
-  const queue = new WorkflowQueue('child_queue');
+  const queue = { name: 'child_queue' };
   beforeAll(() => {
     config = generateDBOSTestConfig();
     DBOS.setConfig(config);
@@ -767,6 +1132,7 @@ describe('test-list-steps', () => {
   beforeEach(async () => {
     await setUpDBOSTestSysDb(config);
     await DBOS.launch();
+    await DBOS.registerQueue(queue.name, { onConflict: 'always_update' });
   });
   afterEach(async () => {
     await DBOS.shutdown();
@@ -889,14 +1255,14 @@ describe('test-list-steps', () => {
     }
 
     @DBOS.workflow()
-    static async startFailingStep() {
-      const handle = await DBOS.startWorkflow(TestListSteps).failingStep();
+    static async startFailingChild() {
+      const handle = await DBOS.startWorkflow(TestListSteps).callFailingStep();
       return await handle.getResult();
     }
 
     @DBOS.workflow()
-    static async enqueueFailingStep() {
-      const handle = await DBOS.startWorkflow(TestListSteps, { queueName: queue.name }).failingStep();
+    static async enqueueFailingChild() {
+      const handle = await DBOS.startWorkflow(TestListSteps, { queueName: queue.name }).callFailingStep();
       return await handle.getResult();
     }
 
@@ -939,12 +1305,16 @@ describe('test-list-steps', () => {
   test('test-step-timing', async () => {
     const startTime = Date.now();
     const handle = await DBOS.startWorkflow(stepTimingWorkflow)();
+    await handle.getResult();
 
     const steps = await DBOS.listWorkflowSteps(handle.workflowID);
     assert(steps);
+    assert(steps.length > 0);
     for (const s of steps) {
       assert(s.startedAtEpochMs);
       assert(s.completedAtEpochMs);
+      assert.strictEqual(typeof s.startedAtEpochMs, 'number');
+      assert.strictEqual(typeof s.completedAtEpochMs, 'number');
       assert(s.startedAtEpochMs >= startTime);
       assert(s.completedAtEpochMs >= s.startedAtEpochMs);
       if (s.functionID < numStepTimingSteps) {
@@ -976,6 +1346,80 @@ describe('test-list-steps', () => {
     await handle.getResult();
     const wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(randomUUID());
     expect(wfsteps).toBeUndefined();
+  });
+
+  test('test-list-steps-pagination', async () => {
+    const wfid = randomUUID();
+    const handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).testWorkflow();
+    await handle.getResult();
+
+    // All steps returned without pagination
+    const allSteps = await DBOS.listWorkflowSteps(wfid);
+    expect(allSteps!.length).toBe(3);
+
+    // Limit 2 returns the first two steps
+    const limited = await DBOS.listWorkflowSteps(wfid, { limit: 2 });
+    expect(limited!.length).toBe(2);
+    expect(limited![0].name).toBe('stepOne');
+    expect(limited![1].name).toBe('stepTwo');
+
+    // Limit 2 offset 1 returns the second and third steps
+    const paginated = await DBOS.listWorkflowSteps(wfid, { limit: 2, offset: 1 });
+    expect(paginated!.length).toBe(2);
+    expect(paginated![0].name).toBe('stepTwo');
+    expect(paginated![1].name).toBe('DBOS.sleep');
+
+    // Offset 2 returns only the last step
+    const offsetOnly = await DBOS.listWorkflowSteps(wfid, { offset: 2 });
+    expect(offsetOnly!.length).toBe(1);
+    expect(offsetOnly![0].name).toBe('DBOS.sleep');
+  });
+
+  test('test-list-steps-load-output-false-skips-payloads', async () => {
+    const wfid = randomUUID();
+    const handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).testWorkflow();
+    await handle.getResult();
+
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const withOutput = await sysdb.getAllOperationResults(wfid);
+    expect(withOutput.length).toBe(3);
+    expect(withOutput[0].output).not.toBeUndefined();
+
+    const withoutOutput = await sysdb.getAllOperationResults(wfid, undefined, undefined, false);
+    expect(withoutOutput.length).toBe(3);
+    for (const row of withoutOutput) {
+      expect(row.output).toBeUndefined();
+      expect(row.error).toBeUndefined();
+    }
+
+    const steps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid, false);
+    expect(steps!.length).toBe(3);
+    expect(steps![0].name).toBe('stepOne');
+    expect(steps![0].output).toBeNull();
+    expect(steps![0].error).toBeNull();
+  });
+
+  test('test-list-workflows-has-parent', async () => {
+    // Run a parent workflow that starts a child
+    const parentId = randomUUID();
+    const handle = await DBOS.startWorkflow(TestListSteps, { workflowID: parentId }).callChildWorkflowfirst();
+    const childId = await handle.getResult();
+
+    // Also run a standalone workflow (no parent)
+    const standaloneId = randomUUID();
+    await DBOS.startWorkflow(TestListSteps, { workflowID: standaloneId }).testWorkflow();
+
+    // hasParent=true returns only the child workflow
+    const withParent = await DBOS.listWorkflows({ hasParent: true });
+    expect(withParent.length).toBe(1);
+    expect(withParent[0].workflowID).toBe(childId);
+
+    // hasParent=false returns workflows without a parent
+    const withoutParent = await DBOS.listWorkflows({ hasParent: false });
+    const ids = new Set(withoutParent.map((w) => w.workflowID));
+    expect(ids).toContain(parentId);
+    expect(ids).toContain(standaloneId);
+    expect(ids).not.toContain(childId);
   });
 
   test('test-send-recv', async () => {
@@ -1160,10 +1604,10 @@ describe('test-list-steps', () => {
 
   test('test-list-failing-step', async () => {
     // Test calling a failing step directly
-    let wfid = randomUUID();
-    let handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).callFailingStep();
+    const wfid = randomUUID();
+    const handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).callFailingStep();
     await expect(handle.getResult()).rejects.toThrow(new Error('fail'));
-    let wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid);
+    const wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid);
     if (!wfsteps) {
       throw new Error('wfsteps is undefined');
     }
@@ -1172,41 +1616,31 @@ describe('test-list-steps', () => {
     expect(wfsteps[0].output).toBe(null);
     expect(wfsteps[0].error).toBeInstanceOf(Error);
     expect(wfsteps[0].childWorkflowID).toBe(null);
-    // Test starting a failing step
-    wfid = randomUUID();
-    handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).startFailingStep();
-    await expect(handle.getResult()).rejects.toThrow(new Error('fail'));
-    wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid);
-    if (!wfsteps) {
-      throw new Error('wfsteps is undefined');
-    }
-    expect(wfsteps.length).toBe(2);
-    expect(wfsteps[0].name).toBe('temp_workflow-step-failingStep');
-    expect(wfsteps[0].output).toBe(null);
-    expect(wfsteps[0].error).toBe(null);
-    expect(wfsteps[0].childWorkflowID).toBe(`${wfid}-0`);
-    expect(wfsteps[1].name).toBe('DBOS.getResult');
-    expect(wfsteps[1].output).toBe(null);
-    expect(wfsteps[1].error).toBeInstanceOf(Error);
-    expect(wfsteps[1].childWorkflowID).toBe(`${wfid}-0`);
-    // Test enqueueing a failing step
-    wfid = randomUUID();
-    handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).enqueueFailingStep();
-    await expect(handle.getResult()).rejects.toThrow(new Error('fail'));
+  });
 
-    wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid);
-    if (!wfsteps) {
-      throw new Error('wfsteps is undefined');
+  test('test-list-failing-child-workflow', async () => {
+    // The child's failure is recorded on the parent's getResult checkpoint, not on the start checkpoint.
+    for (const start of [
+      (id: string) => DBOS.startWorkflow(TestListSteps, { workflowID: id }).startFailingChild(),
+      (id: string) => DBOS.startWorkflow(TestListSteps, { workflowID: id }).enqueueFailingChild(),
+    ]) {
+      const wfid = randomUUID();
+      const handle = await start(wfid);
+      await expect(handle.getResult()).rejects.toThrow(new Error('fail'));
+      const wfsteps = await DBOSExecutor.globalInstance!.listWorkflowSteps(wfid);
+      if (!wfsteps) {
+        throw new Error('wfsteps is undefined');
+      }
+      expect(wfsteps.length).toBe(2);
+      expect(wfsteps[0].name).toBe('callFailingStep');
+      expect(wfsteps[0].output).toBe(null);
+      expect(wfsteps[0].error).toBe(null);
+      expect(wfsteps[0].childWorkflowID).toBe(`${wfid}-0`);
+      expect(wfsteps[1].name).toBe('DBOS.getResult');
+      expect(wfsteps[1].output).toBe(null);
+      expect(wfsteps[1].error).toBeInstanceOf(Error);
+      expect(wfsteps[1].childWorkflowID).toBe(`${wfid}-0`);
     }
-    expect(wfsteps.length).toBe(2);
-    expect(wfsteps[0].name).toBe('temp_workflow-step-failingStep');
-    expect(wfsteps[0].output).toBe(null);
-    expect(wfsteps[0].error).toBe(null);
-    expect(wfsteps[0].childWorkflowID).toBe(`${wfid}-0`);
-    expect(wfsteps[1].name).toBe('DBOS.getResult');
-    expect(wfsteps[1].output).toBe(null);
-    expect(wfsteps[1].error).toBeInstanceOf(Error);
-    expect(wfsteps[1].childWorkflowID).toBe(`${wfid}-0`);
   });
 
   test('test-child-rerun', async () => {
@@ -1219,7 +1653,12 @@ describe('test-list-steps', () => {
     expect(result1).toEqual(result2);
 
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON);
+    const sysdb = createSystemDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      logger: new GlobalLogger(),
+      serializer: DBOSJSON,
+      sharding: usingSharding(),
+    });
     try {
       const wfs = await listWorkflows(sysdb, {});
       expect(wfs.length).toBe(2);
@@ -1318,6 +1757,7 @@ describe('test-fork', () => {
     ExampleWorkflow.childWorkflowCount = 0;
     await setUpDBOSTestSysDb(config);
     await DBOS.launch();
+    await DBOS.registerQueue('test_resume_fork_queue', { onConflict: 'always_update' });
   });
   afterEach(async () => {
     await DBOS.shutdown();
@@ -1333,6 +1773,13 @@ describe('test-fork', () => {
     static transactionTwoCount = 0;
     static transactionThreeCount = 0;
     static childWorkflowCount = 0;
+    static steplessCount = 0;
+
+    @DBOS.workflow()
+    static async steplessWorkflow(): Promise<number> {
+      ExampleWorkflow.steplessCount += 1;
+      return Promise.resolve(42);
+    }
 
     @DBOS.workflow()
     static async stepsWorkflow(input: number): Promise<number> {
@@ -1388,11 +1835,52 @@ describe('test-fork', () => {
     }
 
     @DBOS.workflow()
+    static async forkThenStartWorkflow(id: string, assignedID: string): Promise<[string, string]> {
+      return await DBOS.withNextWorkflowID(assignedID, async () => {
+        const forked = await DBOS.forkWorkflow(id, 0);
+        const started = await DBOS.startWorkflow(ExampleWorkflow).steplessWorkflow();
+        return [forked.workflowID, started.workflowID];
+      });
+    }
+
+    @DBOS.workflow()
     static async parentWorkflow() {
       await ExampleWorkflow.stepOne(1);
       const handle = await DBOS.startWorkflow(ExampleWorkflow).childWorkflow();
       await handle.getResult();
       await ExampleWorkflow.stepTwo(1);
+    }
+
+    @DBOS.step()
+    static async failableStepOne(): Promise<number> {
+      ExampleWorkflow.stepOneCount++;
+      return Promise.resolve(1);
+    }
+
+    @DBOS.step()
+    static async failableStepTwo(): Promise<number> {
+      ExampleWorkflow.stepTwoCount++;
+      if (ExampleWorkflow.stepTwoCount === 1) {
+        throw new Error('step two failed');
+      }
+      return Promise.resolve(2);
+    }
+
+    @DBOS.step()
+    static async failableStepThree(): Promise<number> {
+      ExampleWorkflow.stepThreeCount++;
+      if (ExampleWorkflow.stepThreeCount === 1) {
+        throw new Error('step three failed');
+      }
+      return Promise.resolve(3);
+    }
+
+    @DBOS.workflow()
+    static async failableThreeStepWorkflow(): Promise<number> {
+      const a = await ExampleWorkflow.failableStepOne();
+      const b = await ExampleWorkflow.failableStepTwo();
+      const c = await ExampleWorkflow.failableStepThree();
+      return a + b + c;
     }
   }
 
@@ -1409,51 +1897,107 @@ describe('test-fork', () => {
     expect(ExampleWorkflow.stepFiveCount).toBe(1);
 
     const forkedHandle = await DBOS.forkWorkflow(wfid, 0);
-    expect((await forkedHandle.getStatus())?.forkedFrom).toBe(wfid);
+    const forkedStatus = await forkedHandle.getStatus();
+    expect(forkedStatus?.forkedFrom).toBe(wfid);
+    expect(forkedStatus?.timeoutMS).toBeUndefined(); // No timeout when not specified
     let forkresult = await forkedHandle.getResult();
     expect(forkresult).toBe(550);
 
-    expect(ExampleWorkflow.stepOneCount).toBe(2);
-    expect(ExampleWorkflow.stepTwoCount).toBe(2);
-    expect(ExampleWorkflow.stepThreeCount).toBe(2);
-    expect(ExampleWorkflow.stepFourCount).toBe(2);
-    expect(ExampleWorkflow.stepFiveCount).toBe(2);
+    // Fork with an explicit timeout and verify it's set
+    const forkedWithTimeout = await DBOS.forkWorkflow(wfid, 0, { timeoutMS: 60000 });
+    const timeoutStatus = await forkedWithTimeout.getStatus();
+    expect(timeoutStatus?.timeoutMS).toBe(60000);
+    await forkedWithTimeout.getResult();
+
+    expect(ExampleWorkflow.stepOneCount).toBe(3);
+    expect(ExampleWorkflow.stepTwoCount).toBe(3);
+    expect(ExampleWorkflow.stepThreeCount).toBe(3);
+    expect(ExampleWorkflow.stepFourCount).toBe(3);
+    expect(ExampleWorkflow.stepFiveCount).toBe(3);
 
     const forkedHandle2 = await DBOS.forkWorkflow(wfid, 2);
     expect((await forkedHandle2.getStatus())?.forkedFrom).toBe(wfid);
     forkresult = await forkedHandle2.getResult();
     expect(result).toBe(550);
 
-    expect(ExampleWorkflow.stepOneCount).toBe(2);
-    expect(ExampleWorkflow.stepTwoCount).toBe(2);
-    expect(ExampleWorkflow.stepThreeCount).toBe(3);
-    expect(ExampleWorkflow.stepFourCount).toBe(3);
-    expect(ExampleWorkflow.stepFiveCount).toBe(3);
+    expect(ExampleWorkflow.stepOneCount).toBe(3);
+    expect(ExampleWorkflow.stepTwoCount).toBe(3);
+    expect(ExampleWorkflow.stepThreeCount).toBe(4);
+    expect(ExampleWorkflow.stepFourCount).toBe(4);
+    expect(ExampleWorkflow.stepFiveCount).toBe(4);
 
     const forkedHandle3 = await DBOS.forkWorkflow(wfid, 4);
     expect((await forkedHandle3.getStatus())?.forkedFrom).toBe(wfid);
     forkresult = await forkedHandle3.getResult();
     expect(forkresult).toBe(550);
 
-    expect(ExampleWorkflow.stepOneCount).toBe(2);
-    expect(ExampleWorkflow.stepTwoCount).toBe(2);
-    expect(ExampleWorkflow.stepThreeCount).toBe(3);
-    expect(ExampleWorkflow.stepFourCount).toBe(3);
-    expect(ExampleWorkflow.stepFiveCount).toBe(4);
+    expect(ExampleWorkflow.stepOneCount).toBe(3);
+    expect(ExampleWorkflow.stepTwoCount).toBe(3);
+    expect(ExampleWorkflow.stepThreeCount).toBe(4);
+    expect(ExampleWorkflow.stepFourCount).toBe(4);
+    expect(ExampleWorkflow.stepFiveCount).toBe(5);
 
     const forkedWorkflows = await DBOS.listWorkflows({ forkedFrom: handle.workflowID });
-    expect(forkedWorkflows.length).toBe(3);
+    expect(forkedWorkflows.length).toBe(4);
     expect(forkedWorkflows[0].workflowID).toBe(forkedHandle.workflowID);
-    expect(forkedWorkflows[1].workflowID).toBe(forkedHandle2.workflowID);
-    expect(forkedWorkflows[2].workflowID).toBe(forkedHandle3.workflowID);
+    expect(forkedWorkflows[1].workflowID).toBe(forkedWithTimeout.workflowID);
+    expect(forkedWorkflows[2].workflowID).toBe(forkedHandle2.workflowID);
+    expect(forkedWorkflows[3].workflowID).toBe(forkedHandle3.workflowID);
 
     // Test forkedFrom as a list
     const forkedWorkflows2 = await DBOS.listWorkflows({ forkedFrom: [handle.workflowID, 'nonexistent-id'] });
-    expect(forkedWorkflows2.length).toBe(3);
+    expect(forkedWorkflows2.length).toBe(4);
 
     const forkedWorkflows3 = await DBOS.listWorkflows({ forkedFrom: ['nonexistent-id'] });
     expect(forkedWorkflows3.length).toBe(0);
-  }, 10000);
+
+    // The original workflow should be marked as having been forked from.
+    const originalStatus = await handle.getStatus();
+    expect(originalStatus?.wasForkedFrom).toBe(true);
+    // Forked workflows are not themselves forked from.
+    for (const fh of [forkedHandle, forkedWithTimeout, forkedHandle2, forkedHandle3]) {
+      const forkStatus = await fh.getStatus();
+      expect(forkStatus?.wasForkedFrom).toBe(false);
+    }
+
+    // Filter by wasForkedFrom=true returns only the original; false returns only the forks.
+    const forkedFromWorkflows = await DBOS.listWorkflows({ wasForkedFrom: true });
+    expect(forkedFromWorkflows.length).toBe(1);
+    expect(forkedFromWorkflows[0].workflowID).toBe(wfid);
+    const notForkedFromWorkflows = await DBOS.listWorkflows({ wasForkedFrom: false });
+    const notForkedFromIDs = new Set(notForkedFromWorkflows.map((w) => w.workflowID));
+    expect(notForkedFromIDs).toContain(forkedHandle.workflowID);
+    expect(notForkedFromIDs).toContain(forkedWithTimeout.workflowID);
+    expect(notForkedFromIDs).toContain(forkedHandle2.workflowID);
+    expect(notForkedFromIDs).toContain(forkedHandle3.workflowID);
+
+    // isFork filters the other end of the relationship: the forks themselves.
+    const forkIDs = [
+      forkedHandle.workflowID,
+      forkedWithTimeout.workflowID,
+      forkedHandle2.workflowID,
+      forkedHandle3.workflowID,
+    ];
+    const isForkWorkflows = await DBOS.listWorkflows({ isFork: true });
+    const isForkIDs = new Set(isForkWorkflows.map((w) => w.workflowID));
+    for (const w of isForkWorkflows) {
+      expect(w.forkedFrom).toBeDefined();
+    }
+    for (const id of forkIDs) {
+      expect(isForkIDs).toContain(id);
+    }
+    expect(isForkIDs).not.toContain(wfid);
+
+    const notForkWorkflows = await DBOS.listWorkflows({ isFork: false });
+    const notForkIDs = new Set(notForkWorkflows.map((w) => w.workflowID));
+    for (const w of notForkWorkflows) {
+      expect(w.forkedFrom).toBeUndefined();
+    }
+    expect(notForkIDs).toContain(wfid);
+    for (const id of forkIDs) {
+      expect(notForkIDs).not.toContain(id);
+    }
+  });
 
   test('test-fork-childwf', async () => {
     const wfid = randomUUID();
@@ -1526,6 +2070,27 @@ describe('test-fork', () => {
     expect(ExampleWorkflow.stepThreeCount).toBe(2);
     expect(ExampleWorkflow.stepFourCount).toBe(2);
     expect(ExampleWorkflow.stepFiveCount).toBe(2);
+  });
+
+  test('test-fork-WithNextWorkflowId-replay', async () => {
+    const targetID = randomUUID();
+    await (await DBOS.startWorkflow(ExampleWorkflow, { workflowID: targetID }).steplessWorkflow()).getResult();
+
+    const parentID = randomUUID();
+    const assignedID = randomUUID();
+    const handle = await DBOS.startWorkflow(ExampleWorkflow, { workflowID: parentID }).forkThenStartWorkflow(
+      targetID,
+      assignedID,
+    );
+    const result = await handle.getResult();
+    const steps = (await DBOS.listWorkflowSteps(parentID))!;
+    const startStepID = steps.find((s) => s.name !== 'DBOS.forkWorkflow' && s.childWorkflowID)!.functionID;
+    expect(result).toEqual([assignedID, `${parentID}-${startStepID}`]);
+
+    // Replay the fork step from its checkpoint and run the start live: the assigned ID is
+    // still consumed by the fork, so the start derives its ID instead of reusing it.
+    const forked = await DBOS.forkWorkflow<[string, string]>(parentID, startStepID);
+    await expect(forked.getResult()).resolves.toEqual([assignedID, `${forked.workflowID}-${startStepID}`]);
   });
 
   test('test-fork-version', async () => {
@@ -1639,7 +2204,7 @@ describe('test-fork', () => {
       }
       expect(finalValues).toEqual([0, 1, 2]);
     }
-  }, 10000);
+  });
 
   const testForkEventsKey = 'event_key';
   const testForkEventsEvent = new Event();
@@ -1691,7 +2256,291 @@ describe('test-fork', () => {
       expect(await forkHandle.getResult()).toBeTruthy();
       expect(await DBOS.getEvent(forkHandle.workflowID, testForkEventsKey)).toBe(2);
     }
-  }, 10000);
+  });
+
+  const forkTwiceWorkflow = DBOS.registerWorkflow(
+    async () => {
+      await DBOS.setEvent('key', 0);
+      await DBOS.setEvent('key', 1);
+    },
+    { name: 'fork-twice-workflow' },
+  );
+
+  test('forking-one-workflow-twice-in-one-call', async () => {
+    // Each fork in a batch gets the original's latest events, even when one batch forks the same workflow twice.
+    const handle = await DBOS.startWorkflow(forkTwiceWorkflow)();
+    await handle.getResult();
+    const forks = [randomUUID(), randomUUID()];
+    await DBOSExecutor.globalInstance!.systemDatabase.bulkForkWorkflows(
+      [handle.workflowID, handle.workflowID],
+      forks,
+      [2, 2],
+    );
+    for (const fork of forks) {
+      expect(await DBOS.getEvent(fork, 'key', 0)).toBe(1);
+    }
+  });
+
+  class ResumeForkQueueWorkflow {
+    static stepOneCount = 0;
+    static stepTwoCount = 0;
+    static step1Gate = new Event();
+    static step1Started = new Event();
+    static runExited = new Event();
+
+    @DBOS.step()
+    static async stepOne(x: number): Promise<number> {
+      await Promise.resolve();
+      ResumeForkQueueWorkflow.stepOneCount++;
+      return x + 1;
+    }
+
+    @DBOS.step()
+    static async stepTwo(x: number): Promise<number> {
+      await Promise.resolve();
+      ResumeForkQueueWorkflow.stepTwoCount++;
+      return x + 2;
+    }
+
+    @DBOS.workflow()
+    static async simpleWorkflow(x: number): Promise<number> {
+      try {
+        const a = await ResumeForkQueueWorkflow.stepOne(x);
+        ResumeForkQueueWorkflow.step1Started.set();
+        await ResumeForkQueueWorkflow.step1Gate.wait();
+        const b = await ResumeForkQueueWorkflow.stepTwo(x);
+        return a + b;
+      } finally {
+        ResumeForkQueueWorkflow.runExited.set();
+      }
+    }
+  }
+
+  test('test-resume-and-fork-to-queue', async () => {
+    ResumeForkQueueWorkflow.stepOneCount = 0;
+    ResumeForkQueueWorkflow.stepTwoCount = 0;
+    ResumeForkQueueWorkflow.step1Gate = new Event();
+    ResumeForkQueueWorkflow.step1Started = new Event();
+    ResumeForkQueueWorkflow.runExited = new Event();
+
+    const input = 5;
+    const expectedOutput = input + 1 + (input + 2);
+
+    // Enqueue workflow, let stepOne run, then cancel before stepTwo
+    const wfid = randomUUID();
+    const handle = await DBOS.startWorkflow(ResumeForkQueueWorkflow, {
+      workflowID: wfid,
+      queueName: 'test_resume_fork_queue',
+    }).simpleWorkflow(input);
+    await ResumeForkQueueWorkflow.step1Started.wait();
+    await DBOS.cancelWorkflow(wfid);
+    ResumeForkQueueWorkflow.step1Gate.set();
+    await expect(handle.getResult()).rejects.toThrow(DBOSAwaitedWorkflowCancelledError);
+    // The cancelled run outlives getResult; resumed before it exits, it would run stepTwo too.
+    await ResumeForkQueueWorkflow.runExited.wait();
+    // Cancelling keeps the workflow's queue for a later resume
+    await expect(DBOS.getWorkflowStatus(wfid)).resolves.toMatchObject({
+      status: StatusString.CANCELLED,
+      queueName: 'test_resume_fork_queue',
+    });
+    expect(ResumeForkQueueWorkflow.stepOneCount).toBe(1);
+    expect(ResumeForkQueueWorkflow.stepTwoCount).toBe(0);
+
+    // Resume the workflow onto the queue and verify queue_name
+    ResumeForkQueueWorkflow.step1Gate = new Event();
+    ResumeForkQueueWorkflow.step1Gate.set(); // Don't block on replay
+    ResumeForkQueueWorkflow.step1Started = new Event();
+    const resumedHandle = await DBOS.resumeWorkflow(wfid, { queueName: 'test_resume_fork_queue' });
+    const resumedStatus = await resumedHandle.getStatus();
+    expect(resumedStatus?.queueName).toBe('test_resume_fork_queue');
+    await expect(resumedHandle.getResult()).resolves.toBe(expectedOutput);
+    expect(ResumeForkQueueWorkflow.stepOneCount).toBe(1); // Step 1 replayed from checkpoint
+    expect(ResumeForkQueueWorkflow.stepTwoCount).toBe(1);
+
+    // Fork the workflow onto the queue from step 1 and verify queue_name
+    ResumeForkQueueWorkflow.step1Gate = new Event();
+    ResumeForkQueueWorkflow.step1Gate.set();
+    ResumeForkQueueWorkflow.step1Started = new Event();
+    const forkedHandle = await DBOS.forkWorkflow(wfid, 1, {
+      queueName: 'test_resume_fork_queue',
+      queuePartitionKey: 'my_partition',
+    });
+    const forkedStatus = await forkedHandle.getStatus();
+    expect(forkedStatus?.queueName).toBe('test_resume_fork_queue');
+    expect(forkedStatus?.forkedFrom).toBe(wfid);
+    await expect(forkedHandle.getResult()).resolves.toBe(expectedOutput);
+    expect(ResumeForkQueueWorkflow.stepOneCount).toBe(1); // Step 1 replayed from checkpoint
+    expect(ResumeForkQueueWorkflow.stepTwoCount).toBe(2); // Step 2 was re-executed
+  });
+
+  const delayedOnKeepQueue = { queuePartitionKey: 'p0', priority: 3, delaySeconds: 3600 };
+
+  class KeepQueue {
+    @DBOS.workflow()
+    static async echo(x: number): Promise<number> {
+      return Promise.resolve(x);
+    }
+
+    @DBOS.workflow()
+    static async parent(): Promise<string> {
+      const handle = await DBOS.startWorkflow(KeepQueue, {
+        queueName: 'keep_queue',
+        enqueueOptions: delayedOnKeepQueue,
+      }).echo(0);
+      return handle.workflowID;
+    }
+  }
+
+  /** Enqueue delayed workflows on the partitioned queue and cancel them before they run. */
+  async function cancelDelayed(count: number): Promise<string[]> {
+    const ids = Array.from({ length: count }, () => randomUUID());
+    for (const [i, workflowID] of ids.entries()) {
+      await DBOS.startWorkflow(KeepQueue, {
+        workflowID,
+        queueName: 'keep_queue',
+        enqueueOptions: delayedOnKeepQueue,
+      }).echo(i);
+    }
+    await DBOS.cancelWorkflows(ids);
+    return ids;
+  }
+
+  async function queueColumns(workflowID: string) {
+    const status = await DBOS.getWorkflowStatus(workflowID);
+    return [status?.queueName, status?.queuePartitionKey, status?.priority];
+  }
+
+  test('test-management-keeps-queue', async () => {
+    await DBOS.registerQueue('keep_queue', { partitionConcurrency: 2, onConflict: 'always_update' });
+    await DBOS.registerQueue('other_queue', { onConflict: 'always_update' });
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      // Cancelling children keeps their queue, partition key, and priority
+      const parentID = randomUUID();
+      const childID = await DBOS.withNextWorkflowID(parentID, () => KeepQueue.parent());
+      await DBOS.cancelWorkflow(parentID, { cancelChildren: true });
+      await expect(DBOS.getWorkflowStatus(childID)).resolves.toMatchObject({ status: StatusString.CANCELLED });
+      expect(await queueColumns(childID)).toEqual(['keep_queue', 'p0', 3]);
+
+      // A plain resume puts it back exactly where it was
+      const handle = await DBOS.resumeWorkflow<number>(childID);
+      expect(await queueColumns(childID)).toEqual(['keep_queue', 'p0', 3]);
+      await expect(handle.getResult()).resolves.toBe(0);
+
+      // Each resume variant changes only the key; columns are checked before results so a regression fails, not hangs
+      const variants: ((ids: string[], key: string) => Promise<WorkflowHandle<number>[]>)[] = [
+        async (ids, key) => {
+          const handles: WorkflowHandle<number>[] = [];
+          for (const id of ids) handles.push(await client.resumeWorkflow<number>(id, { queuePartitionKey: key }));
+          return handles;
+        },
+        (ids, key) => client.resumeWorkflows<number>(ids, { queuePartitionKey: key }),
+        async (ids, key) => {
+          const handles: WorkflowHandle<number>[] = [];
+          for (const id of ids) handles.push(await DBOS.resumeWorkflow<number>(id, { queuePartitionKey: key }));
+          return handles;
+        },
+        (ids, key) => DBOS.resumeWorkflows<number>(ids, { queuePartitionKey: key }),
+      ];
+      for (const [n, resume] of variants.entries()) {
+        const ids = await cancelDelayed(2);
+        const handles = await resume(ids, `k${n}`);
+        for (const id of ids) {
+          expect(await queueColumns(id)).toEqual(['keep_queue', `k${n}`, 3]);
+        }
+        for (const [i, h] of handles.entries()) {
+          await expect(h.getResult()).resolves.toBe(i);
+        }
+      }
+
+      // A queue name changes only the queue; naming its own partitioned queue keeps the key
+      for (const queueName of ['keep_queue', 'other_queue']) {
+        const [workflowID] = await cancelDelayed(1);
+        const resumed = await DBOS.resumeWorkflow<number>(workflowID, { queueName });
+        expect(await queueColumns(workflowID)).toEqual([queueName, 'p0', 3]);
+        await expect(resumed.getResult()).resolves.toBe(0);
+      }
+
+      // Forks inherit queue, key, and priority; a key or a queue overrides only itself
+      const forkCases: [{ queueName?: string; queuePartitionKey?: string }, unknown[]][] = [
+        [{}, ['keep_queue', 'p0', 3]],
+        [{ queuePartitionKey: 'f' }, ['keep_queue', 'f', 3]],
+        [{ queueName: 'other_queue' }, ['other_queue', 'p0', 3]],
+      ];
+      for (const [options, expected] of forkCases) {
+        const forked = await DBOS.forkWorkflow<number>(childID, 0, options);
+        expect(await queueColumns(forked.workflowID)).toEqual(expected);
+        await expect(forked.getResult()).resolves.toBe(0);
+      }
+    } finally {
+      await client.destroy();
+    }
+    expect(await queueEntriesAreCleanedUp()).toBe(true);
+  });
+
+  let replacementChildMultiplier = 2;
+
+  class ReplacementChildTest {
+    static childIds: string[] = [];
+
+    @DBOS.step()
+    static async childStep(x: number): Promise<number> {
+      return Promise.resolve(x * replacementChildMultiplier);
+    }
+
+    @DBOS.workflow()
+    static async childWf(x: number): Promise<number> {
+      return await ReplacementChildTest.childStep(x);
+    }
+
+    @DBOS.step()
+    static async combine(results: number[]): Promise<number> {
+      return Promise.resolve(results.reduce((a, b) => a + b, 0));
+    }
+
+    @DBOS.workflow()
+    static async parentWf(): Promise<number> {
+      const h1 = await DBOS.startWorkflow(ReplacementChildTest).childWf(10);
+      const h2 = await DBOS.startWorkflow(ReplacementChildTest).childWf(20);
+      const h3 = await DBOS.startWorkflow(ReplacementChildTest).childWf(30);
+      const h4 = await DBOS.startWorkflow(ReplacementChildTest).childWf(40);
+      const h5 = await DBOS.startWorkflow(ReplacementChildTest).childWf(50);
+      ReplacementChildTest.childIds = [h1, h2, h3, h4, h5].map((h) => h.workflowID);
+      const results = await Promise.all([h1, h2, h3, h4, h5].map((h) => h.getResult()));
+      return await ReplacementChildTest.combine(results);
+    }
+  }
+
+  test('test-fork-replacement-children', async () => {
+    replacementChildMultiplier = 2;
+
+    const parentHandle = await DBOS.startWorkflow(ReplacementChildTest).parentWf();
+    const originalResult = await parentHandle.getResult();
+    expect(originalResult).toBe(300); // sum of x*2 for x in [10,20,30,40,50]
+    expect(ReplacementChildTest.childIds.length).toBe(5);
+    const origIds = [...ReplacementChildTest.childIds];
+
+    replacementChildMultiplier = 10;
+
+    // Fork children 0, 2, and 4 from step 0 (re-run childStep with new multiplier)
+    const forkedChild0 = await DBOS.forkWorkflow(origIds[0], 0);
+    const forkedChild2 = await DBOS.forkWorkflow(origIds[2], 0);
+    const forkedChild4 = await DBOS.forkWorkflow(origIds[4], 0);
+    expect(await forkedChild0.getResult()).toBe(100);
+    expect(await forkedChild2.getResult()).toBe(300);
+    expect(await forkedChild4.getResult()).toBe(500);
+
+    // Fork the parent from step 5 (combine): replays steps 0-4 with replaced child IDs, re-runs combine
+    const forkedParent = await DBOS.forkWorkflow(parentHandle.workflowID, 5, {
+      replacementChildren: {
+        [origIds[0]]: forkedChild0.workflowID,
+        [origIds[2]]: forkedChild2.workflowID,
+        [origIds[4]]: forkedChild4.workflowID,
+      },
+    });
+    const forkedResult = await forkedParent.getResult();
+    expect(forkedResult).toBe(1020); // [100, 40, 300, 80, 500]
+  });
 });
 
 describe('wf-cancel-tests', () => {
@@ -1712,7 +2561,7 @@ describe('wf-cancel-tests', () => {
 
   afterEach(async () => {
     await DBOS.shutdown();
-  }, 10000);
+  });
 
   test('test-two-steps-cancel-resume', async () => {
     const wfid = randomUUID();
@@ -1753,17 +2602,6 @@ describe('wf-cancel-tests', () => {
     expect(WFwith2Steps.stepsExecuted).toBe(2);
   });
 
-  test('test-preempt-sleepms', async () => {
-    const wfid = randomUUID();
-    const wfh = await DBOS.startWorkflow(DeepSleep, { workflowID: wfid }).sleepTooLong();
-
-    await expect(DBOS.getResult(wfh.workflowID, 0.2)).resolves.toBeNull();
-    await DBOS.cancelWorkflow(wfid);
-
-    await expect(DBOS.getResult(wfh.workflowID)).rejects.toThrow(DBOSAwaitedWorkflowCancelledError);
-    await expect(wfh.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
-  });
-
   test('test-preempt-getresult', async () => {
     const wfid = randomUUID();
     const wfh = await DBOS.startWorkflow(DeepSleep, { workflowID: wfid }).getResultTooLong();
@@ -1797,6 +2635,106 @@ describe('wf-cancel-tests', () => {
     await expect(wfh.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
   });
 
+  // A workflow cancelled while blocked awaiting other workflows must not durably
+  // record its own DBOSWorkflowCancelledError as the awaiting step's checkpoint:
+  // CANCELLED is resumable, so on resume the parent must re-execute the await and
+  // pick up the child's result instead of replaying the recorded cancellation.
+  // Affected internal steps: DBOS.getResult, DBOS.waitFirst, DBOS.waitAll — the ones
+  // built on runInternalStep whose callbacks poll the caller's own status.
+  describe('cancel-during-await', () => {
+    class CancelDuringAwait {
+      static childEvent = new Event();
+      static parentPolling = new Event();
+
+      @DBOS.workflow()
+      static async blockedChild(value: number) {
+        await CancelDuringAwait.childEvent.wait();
+        return value;
+      }
+
+      @DBOS.workflow()
+      static async getResultParent(childID: string) {
+        CancelDuringAwait.parentPolling.set();
+        return await DBOS.getResult<number>(childID, { pollingIntervalMs: 50 });
+      }
+
+      @DBOS.workflow()
+      static async waitFirstParent(childID: string) {
+        const handle = DBOS.retrieveWorkflow<number>(childID);
+        CancelDuringAwait.parentPolling.set();
+        await DBOS.waitFirst([handle], { pollingIntervalMs: 50 });
+        return await DBOS.getResult<number>(childID, { pollingIntervalMs: 50 });
+      }
+
+      @DBOS.workflow()
+      static async waitAllParent(childID: string) {
+        const handle = DBOS.retrieveWorkflow<number>(childID);
+        CancelDuringAwait.parentPolling.set();
+        await DBOS.waitAll([handle], { pollingIntervalMs: 50 });
+        return await DBOS.getResult<number>(childID, { pollingIntervalMs: 50 });
+      }
+    }
+
+    beforeEach(() => {
+      CancelDuringAwait.childEvent = new Event();
+      CancelDuringAwait.parentPolling = new Event();
+    });
+
+    afterEach(() => {
+      CancelDuringAwait.childEvent.set(); // unblock any still-pending child
+    });
+
+    const variants: { step: string; start: (childID: string) => Promise<WorkflowHandle<number | null>> }[] = [
+      { step: 'DBOS.getResult', start: (childID) => DBOS.startWorkflow(CancelDuringAwait).getResultParent(childID) },
+      { step: 'DBOS.waitFirst', start: (childID) => DBOS.startWorkflow(CancelDuringAwait).waitFirstParent(childID) },
+      { step: 'DBOS.waitAll', start: (childID) => DBOS.startWorkflow(CancelDuringAwait).waitAllParent(childID) },
+    ];
+
+    async function cancelParentDuringAwait(start: (childID: string) => Promise<WorkflowHandle<number | null>>) {
+      const childID = randomUUID();
+
+      const childHandle = await DBOS.startWorkflow(CancelDuringAwait, { workflowID: childID }).blockedChild(42);
+      const parentHandle = await start(childID);
+      const parentID = parentHandle.workflowID;
+
+      // Let the parent get past runInternalStep's entry checks and into
+      // the sysdb poll loop before cancelling it.
+      await CancelDuringAwait.parentPolling.wait();
+      await sleepms(300);
+      await DBOS.cancelWorkflow(parentID);
+
+      // The parent observes its own cancellation inside the poll loop.
+      await expect(parentHandle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
+      await expect(DBOS.getWorkflowStatus(parentID)).resolves.toMatchObject({ status: StatusString.CANCELLED });
+
+      return { parentID, childHandle };
+    }
+
+    describe.each(variants)('cancelled during $step', ({ step, start }) => {
+      test('parent cancellation is not checkpointed as the step outcome', async () => {
+        const { parentID } = await cancelParentDuringAwait(start);
+
+        // The interrupted step must not be checkpointed, so it re-executes on resume.
+        const steps = await DBOS.listWorkflowSteps(parentID);
+        const awaitStep = steps?.find((s) => s.name === step);
+        expect(awaitStep?.error).toBeFalsy();
+      });
+
+      test('parent picks up child result after resume', async () => {
+        const { parentID, childHandle } = await cancelParentDuringAwait(start);
+
+        // The child completes successfully.
+        CancelDuringAwait.childEvent.set();
+        await expect(childHandle.getResult()).resolves.toBe(42);
+
+        // Resuming the parent should re-execute the await and return the child's result.
+        const resumed = await DBOS.resumeWorkflow<number>(parentID);
+        await expect(resumed.getResult()).resolves.toBe(42);
+        await expect(DBOS.getWorkflowStatus(parentID)).resolves.toMatchObject({ status: StatusString.SUCCESS });
+      });
+    });
+  });
+
   class WFwith2Steps {
     static stepsExecuted = 0;
     static step1Started = new Event();
@@ -1823,12 +2761,6 @@ describe('wf-cancel-tests', () => {
   }
 
   class DeepSleep {
-    @DBOS.workflow()
-    static async sleepTooLong() {
-      await DBOS.sleepms(1000 * 1000);
-      return 'Done';
-    }
-
     @DBOS.workflow()
     static async getResultTooLong() {
       await DBOS.getResult('bogusbogusbogus', 1000);
@@ -1906,113 +2838,6 @@ describe('wf-cancel-tests', () => {
     await DBOS.deleteWorkflow(parentWfid2, false);
   });
 
-  // Workflow export/import test
-  class ExportImportTest {
-    @DBOS.step()
-    static async testStep(): Promise<void> {
-      return Promise.resolve();
-    }
-
-    @DBOS.workflow()
-    static async grandchildWorkflow(): Promise<string> {
-      return Promise.resolve('grandchild-result');
-    }
-
-    @DBOS.workflow()
-    static async childWorkflow(): Promise<string> {
-      const handle = await DBOS.startWorkflow(ExportImportTest).grandchildWorkflow();
-      await handle.getResult();
-      return 'child-result';
-    }
-
-    @DBOS.workflow()
-    static async parentWorkflow(): Promise<string> {
-      const handle = await DBOS.startWorkflow(ExportImportTest).childWorkflow();
-      await handle.getResult();
-      // Run multiple steps
-      for (let i = 0; i < 10; i++) {
-        await ExportImportTest.testStep();
-      }
-      await DBOS.setEvent('key', 'value');
-      await DBOS.writeStream('key', 'value');
-      await DBOS.closeStream('key');
-      return DBOS.workflowID!;
-    }
-  }
-
-  test('test-workflow-export-import', async () => {
-    const workflowId = randomUUID();
-    const handle = await DBOS.startWorkflow(ExportImportTest, { workflowID: workflowId }).parentWorkflow();
-    const result = await handle.getResult();
-    expect(result).toBe(workflowId);
-
-    const sysDb = DBOSExecutor.globalInstance!.systemDatabase;
-
-    // Export with children
-    const exported = await sysDb.exportWorkflow(workflowId, true);
-    const originalSteps = await DBOS.listWorkflowSteps(workflowId);
-
-    // Importing into an existing database fails with a primary key conflict
-    await expect(sysDb.importWorkflow(exported)).rejects.toThrow();
-
-    // Delete the workflows
-    await DBOS.deleteWorkflow(workflowId, true);
-
-    // Importing the workflow succeeds after deletion
-    await sysDb.importWorkflow(exported);
-
-    // All workflow information is present - verify event
-    const eventValue = await DBOS.getEvent(workflowId, 'key');
-    expect(eventValue).toBe('value');
-
-    // Verify stream is restored
-    const streamValues: unknown[] = [];
-    for await (const v of DBOS.readStream(workflowId, 'key')) {
-      streamValues.push(v);
-    }
-    expect(streamValues).toEqual(['value']);
-
-    // Verify steps are restored with same content
-    const importedSteps = await DBOS.listWorkflowSteps(workflowId);
-    expect(importedSteps!.length).toBe(originalSteps!.length);
-    for (let i = 0; i < importedSteps!.length; i++) {
-      expect(importedSteps![i].functionID).toBe(originalSteps![i].functionID);
-      expect(importedSteps![i].name).toBe(originalSteps![i].name);
-    }
-
-    // The child workflows are also copied over (parent + child + grandchild = 3)
-    expect(exported.length).toBe(3);
-    const allWorkflows = await DBOS.listWorkflows({
-      workflowIDs: exported.map((w) => w.workflow_status.workflow_uuid),
-    });
-    expect(allWorkflows.length).toBe(3);
-
-    // Verify parent workflow IDs are set correctly after import
-    const parentStatus = await DBOS.getWorkflowStatus(workflowId);
-    expect(parentStatus).not.toBeNull();
-    expect(parentStatus!.parentWorkflowID).toBeUndefined();
-
-    // Find child workflows by filtering on parentWorkflowID
-    const childWorkflows = await DBOS.listWorkflows({ parentWorkflowID: workflowId });
-    expect(childWorkflows.length).toBe(1);
-    const childWorkflowId = childWorkflows[0].workflowID;
-    expect(childWorkflows[0].parentWorkflowID).toBe(workflowId);
-
-    // Find grandchild workflows
-    const grandchildWorkflows = await DBOS.listWorkflows({ parentWorkflowID: childWorkflowId });
-    expect(grandchildWorkflows.length).toBe(1);
-    expect(grandchildWorkflows[0].parentWorkflowID).toBe(childWorkflowId);
-
-    // The imported workflow can be forked
-    const forkedHandle = await DBOS.forkWorkflow(workflowId, importedSteps!.length);
-    const forkedResult = await forkedHandle.getResult();
-    expect(forkedResult).toBe(forkedHandle.workflowID);
-
-    // The forked workflow has the event
-    const forkedEventValue = await DBOS.getEvent(forkedHandle.workflowID, 'key');
-    expect(forkedEventValue).toBe('value');
-  });
-
   // ==================== Bulk Cancel/Resume/Delete Tests ====================
 
   class BulkCancelTest {
@@ -2073,6 +2898,320 @@ describe('wf-cancel-tests', () => {
     }
 
     expect(BulkCancelTest.stepsCompleted).toBe(3);
+  });
+
+  class CancelChildrenTest {
+    static childID: string;
+    static grandchildID: string;
+    static workflowEvents: Record<string, Event> = {};
+    static mainEvents: Record<string, Event> = {};
+
+    @DBOS.step()
+    static async noop(): Promise<void> {
+      await Promise.resolve();
+    }
+
+    @DBOS.workflow()
+    static async grandchildWorkflow(): Promise<string> {
+      const wfid = DBOS.workflowID!;
+      CancelChildrenTest.mainEvents[wfid].set();
+      await CancelChildrenTest.workflowEvents[wfid].wait();
+      // A step after the wait so the workflow observes its cancellation.
+      await CancelChildrenTest.noop();
+      return wfid;
+    }
+
+    @DBOS.workflow()
+    static async childWorkflow(): Promise<string> {
+      const wfid = DBOS.workflowID!;
+      await DBOS.startWorkflow(CancelChildrenTest, {
+        workflowID: CancelChildrenTest.grandchildID,
+      }).grandchildWorkflow();
+      CancelChildrenTest.mainEvents[wfid].set();
+      await CancelChildrenTest.workflowEvents[wfid].wait();
+      await CancelChildrenTest.noop();
+      return wfid;
+    }
+
+    @DBOS.workflow()
+    static async parentWorkflow(): Promise<string> {
+      const wfid = DBOS.workflowID!;
+      await DBOS.startWorkflow(CancelChildrenTest, { workflowID: CancelChildrenTest.childID }).childWorkflow();
+      CancelChildrenTest.mainEvents[wfid].set();
+      await CancelChildrenTest.workflowEvents[wfid].wait();
+      await CancelChildrenTest.noop();
+      return wfid;
+    }
+  }
+
+  test('test-cancel-workflow-children', async () => {
+    // Build a three-level tree: parent -> child -> grandchild, each blocking.
+    const parentID = randomUUID();
+    const childID = randomUUID();
+    const grandchildID = randomUUID();
+    const ids = [parentID, childID, grandchildID];
+
+    CancelChildrenTest.childID = childID;
+    CancelChildrenTest.grandchildID = grandchildID;
+    CancelChildrenTest.workflowEvents = {};
+    CancelChildrenTest.mainEvents = {};
+    for (const id of ids) {
+      CancelChildrenTest.workflowEvents[id] = new Event();
+      CancelChildrenTest.mainEvents[id] = new Event();
+    }
+
+    const parentHandle = await DBOS.startWorkflow(CancelChildrenTest, { workflowID: parentID }).parentWorkflow();
+
+    // Wait until the whole tree is running and blocked
+    for (const id of ids) {
+      await CancelChildrenTest.mainEvents[id].wait();
+    }
+
+    // The whole descendant tree is recorded: the parent's child, and that child's child
+    const tree = await DBOS.listWorkflows({ parentWorkflowID: [parentID, childID] });
+    expect(new Set(tree.map((w) => w.workflowID))).toEqual(new Set([childID, grandchildID]));
+
+    // Cancelling without cancelChildren only affects the parent
+    await DBOS.cancelWorkflow(parentID);
+    expect((await DBOS.getWorkflowStatus(parentID))!.status).toBe(StatusString.CANCELLED);
+    expect((await DBOS.getWorkflowStatus(childID))!.status).not.toBe(StatusString.CANCELLED);
+    expect((await DBOS.getWorkflowStatus(grandchildID))!.status).not.toBe(StatusString.CANCELLED);
+
+    // Cancelling with cancelChildren cancels the entire subtree
+    await DBOS.cancelWorkflow(parentID, { cancelChildren: true });
+    for (const id of ids) {
+      expect((await DBOS.getWorkflowStatus(id))!.status).toBe(StatusString.CANCELLED);
+    }
+
+    // Release the workflows so they observe the cancellation
+    for (const id of ids) {
+      CancelChildrenTest.workflowEvents[id].set();
+    }
+
+    await expect(parentHandle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
+  });
+
+  class StepCancelSignalTest {
+    static plainRuns = 0;
+    static attempts = 0;
+    static signals: AbortSignal[] = [];
+    static blocked = new Event();
+    static stopped = new Event();
+    static finish = false;
+
+    @DBOS.step()
+    static async plainStep(): Promise<string> {
+      StepCancelSignalTest.plainRuns++;
+      return Promise.resolve('plain');
+    }
+
+    // After attempt 2 the backoff would be 10s, so a prompt cancellation shows no further retry was scheduled
+    @DBOS.step({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0.1, backoffRate: 100 })
+    static async cooperativeStep(): Promise<string> {
+      const attempt = ++StepCancelSignalTest.attempts;
+      const signal = DBOS.stepStatus!.cancelSignal;
+      StepCancelSignalTest.signals.push(signal);
+      if (attempt === 1) throw new Error('transient failure');
+      if (StepCancelSignalTest.finish) return `done-${attempt}`;
+      StepCancelSignalTest.blocked.set();
+      try {
+        await abortableSleep(10_000, undefined, { signal });
+      } finally {
+        StepCancelSignalTest.stopped.set();
+      }
+      return `slept-${attempt}`;
+    }
+
+    @DBOS.workflow()
+    static async signalWorkflow(): Promise<string> {
+      const plain = await StepCancelSignalTest.plainStep();
+      const result = await StepCancelSignalTest.cooperativeStep();
+      return `${plain}-${result}`;
+    }
+  }
+
+  test('test-step-cancel-signal', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    sysdb.dbPollingIntervalCancelMs = 100;
+    StepCancelSignalTest.plainRuns = 0;
+    StepCancelSignalTest.attempts = 0;
+    StepCancelSignalTest.signals = [];
+    StepCancelSignalTest.blocked = new Event();
+    StepCancelSignalTest.stopped = new Event();
+    StepCancelSignalTest.finish = false;
+    const wfid = randomUUID();
+
+    // Attempt 1 fails and is retried; attempt 2 blocks until the signal fires
+    const handle = await DBOS.startWorkflow(StepCancelSignalTest, { workflowID: wfid }).signalWorkflow();
+    await StepCancelSignalTest.blocked.wait();
+    const [first, second] = StepCancelSignalTest.signals;
+    expect(second).toBe(first);
+    expect(first.aborted).toBe(false);
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.PENDING);
+
+    // An in-process cancel fires the signal; the aborted step is neither retried nor recorded
+    let cancelledAt = Date.now();
+    await DBOS.cancelWorkflow(wfid);
+    await expect(handle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
+    expect(Date.now() - cancelledAt).toBeLessThan(5000);
+    expect(first.aborted).toBe(true);
+    expect(first.reason).toBeInstanceOf(DBOSWorkflowCancelledError);
+    expect((first.reason as DBOSWorkflowCancelledError).workflowID).toBe(wfid);
+    expect(StepCancelSignalTest.attempts).toBe(2);
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.CANCELLED);
+    let steps = await DBOS.listWorkflowSteps(wfid);
+    expect(steps!.map((s) => s.name)).toEqual(['plainStep']);
+
+    // On resume the step runs again with a fresh signal, which a cancel from a client also fires
+    while (sysdb.checkForRunningWorkflow(wfid)) {
+      await sleepms(20);
+    }
+    StepCancelSignalTest.blocked = new Event();
+    StepCancelSignalTest.stopped = new Event();
+    const resumed = await DBOS.resumeWorkflow<string>(wfid);
+    await StepCancelSignalTest.blocked.wait();
+    const third = StepCancelSignalTest.signals[2];
+    expect(third).not.toBe(first);
+    expect(third.aborted).toBe(false);
+    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    try {
+      cancelledAt = Date.now();
+      await client.cancelWorkflow(wfid);
+      // The handle reports the cancelled status at once, so wait for the step itself to stop
+      await StepCancelSignalTest.stopped.wait();
+      expect(Date.now() - cancelledAt).toBeLessThan(5000);
+      await expect(resumed.getResult()).rejects.toThrow(DBOSAwaitedWorkflowCancelledError);
+    } finally {
+      await client.destroy();
+    }
+    expect(third.reason).toBeInstanceOf(DBOSWorkflowCancelledError);
+    expect(StepCancelSignalTest.attempts).toBe(3);
+    expect(StepCancelSignalTest.plainRuns).toBe(1);
+    steps = await DBOS.listWorkflowSteps(wfid);
+    expect(steps!.map((s) => s.name)).toEqual(['plainStep']);
+
+    // A final resume lets the step complete: its result is recorded and its signal never fires
+    while (sysdb.checkForRunningWorkflow(wfid)) {
+      await sleepms(20);
+    }
+    StepCancelSignalTest.finish = true;
+    const completed = await DBOS.resumeWorkflow<string>(wfid);
+    await expect(completed.getResult()).resolves.toBe('plain-done-4');
+    expect(StepCancelSignalTest.signals[3].aborted).toBe(false);
+    expect(StepCancelSignalTest.plainRuns).toBe(1);
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.SUCCESS);
+    steps = await DBOS.listWorkflowSteps(wfid);
+    expect(steps!.map((s) => [s.name, s.output])).toEqual([
+      ['plainStep', 'plain'],
+      ['cooperativeStep', 'done-4'],
+    ]);
+  });
+
+  // Leaves ample margin for cancel detection to beat the running attempt's timeout on a slow runner
+  const cancelTestStepTimeoutMS = 2000;
+
+  class StepCancelAndTimeoutTest {
+    static attempts = 0;
+    static timeoutSignals: AbortSignal[] = [];
+    static cancelSignals: AbortSignal[] = [];
+    static observed: unknown[] = []; // The abort reason each attempt stopped on
+    static thirdAttemptStarted = new Event();
+    static abandonedAttemptEnded = new Event();
+
+    // Fires with the reason of whichever of `signals` fires first
+    static anySignal(signals: AbortSignal[]): AbortSignal {
+      const controller = new AbortController();
+      for (const signal of signals) {
+        if (signal.aborted) controller.abort(signal.reason);
+        else signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+      }
+      return controller.signal;
+    }
+
+    @DBOS.step({ retriesAllowed: true, maxAttempts: 3, intervalSeconds: 0, timeoutMS: cancelTestStepTimeoutMS })
+    static async timedStep(): Promise<string> {
+      const attempt = ++StepCancelAndTimeoutTest.attempts;
+      const { timeoutSignal, cancelSignal } = DBOS.stepStatus!;
+      StepCancelAndTimeoutTest.timeoutSignals.push(timeoutSignal!);
+      StepCancelAndTimeoutTest.cancelSignals.push(cancelSignal);
+      if (attempt > 3) return `done-${attempt}`;
+      // Attempt 2 heeds only cancellation, so it keeps running after its timeout abandons it
+      const signal = attempt === 2 ? cancelSignal : StepCancelAndTimeoutTest.anySignal([timeoutSignal!, cancelSignal]);
+      if (attempt === 3) StepCancelAndTimeoutTest.thirdAttemptStarted.set();
+      try {
+        await abortableSleep(10_000, undefined, { signal });
+      } catch (e) {
+        StepCancelAndTimeoutTest.observed[attempt - 1] = signal.reason;
+        throw e;
+      } finally {
+        if (attempt === 2) StepCancelAndTimeoutTest.abandonedAttemptEnded.set();
+      }
+      return `slept-${attempt}`;
+    }
+
+    @DBOS.workflow()
+    static async timedWorkflow(): Promise<string> {
+      return await StepCancelAndTimeoutTest.timedStep();
+    }
+  }
+
+  test('test-step-cancel-signal-with-timeout', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    sysdb.dbPollingIntervalCancelMs = 100;
+    StepCancelAndTimeoutTest.attempts = 0;
+    StepCancelAndTimeoutTest.timeoutSignals = [];
+    StepCancelAndTimeoutTest.cancelSignals = [];
+    StepCancelAndTimeoutTest.observed = [];
+    StepCancelAndTimeoutTest.thirdAttemptStarted = new Event();
+    StepCancelAndTimeoutTest.abandonedAttemptEnded = new Event();
+    const wfid = randomUUID();
+
+    // Attempts 1 and 2 time out; attempt 3 blocks until its timeout or the workflow's cancellation
+    const handle = await DBOS.startWorkflow(StepCancelAndTimeoutTest, { workflowID: wfid }).timedWorkflow();
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.PENDING);
+    await StepCancelAndTimeoutTest.thirdAttemptStarted.wait();
+    const { timeoutSignals, cancelSignals, observed } = StepCancelAndTimeoutTest;
+    const cancelSignal = cancelSignals[0];
+    expect(observed[0]).toBeInstanceOf(DBOSStepTimeoutError);
+    expect(timeoutSignals[0].reason).toBe(observed[0]);
+    expect(timeoutSignals[1].reason).toBeInstanceOf(DBOSStepTimeoutError);
+    expect(observed[1]).toBeUndefined();
+    expect(timeoutSignals[2].aborted).toBe(false);
+
+    // Each attempt has its own timeout signal but all share one cancel signal, which timeouts never fire
+    expect(new Set(timeoutSignals).size).toBe(3);
+    expect(cancelSignals.every((s) => s === cancelSignal)).toBe(true);
+    expect(cancelSignal.aborted).toBe(false);
+
+    // Cancelling stops the running attempt before its timeout, and the abandoned attempt too
+    await DBOS.cancelWorkflow(wfid);
+    await expect(handle.getResult()).rejects.toThrow(DBOSWorkflowCancelledError);
+    await StepCancelAndTimeoutTest.abandonedAttemptEnded.wait();
+    expect(cancelSignal.reason).toBeInstanceOf(DBOSWorkflowCancelledError);
+    expect(observed[1]).toBe(cancelSignal.reason);
+    expect(observed[2]).toBe(cancelSignal.reason);
+    expect(StepCancelAndTimeoutTest.attempts).toBe(3);
+
+    // Neither the timeouts nor the cancelled attempt were recorded as the step's outcome
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.CANCELLED);
+    expect(await DBOS.listWorkflowSteps(wfid)).toEqual([]);
+
+    // The cancelled attempt's timer was cleared, so its timeout signal never fires
+    await sleepms(cancelTestStepTimeoutMS + 200);
+    expect(timeoutSignals[2].aborted).toBe(false);
+
+    // On resume the step gets fresh signals and completes
+    while (sysdb.checkForRunningWorkflow(wfid)) {
+      await sleepms(20);
+    }
+    const resumed = await DBOS.resumeWorkflow<string>(wfid);
+    await expect(resumed.getResult()).resolves.toBe('done-4');
+    expect(cancelSignals[3]).not.toBe(cancelSignal);
+    expect(cancelSignals[3].aborted).toBe(false);
+    expect(timeoutSignals[3].aborted).toBe(false);
+    expect((await DBOS.getWorkflowStatus(wfid))!.status).toBe(StatusString.SUCCESS);
+    const steps = await DBOS.listWorkflowSteps(wfid);
+    expect(steps!.map((s) => [s.name, s.output])).toEqual([['timedStep', 'done-4']]);
   });
 
   class BulkResumeTest {
@@ -2199,119 +3338,4 @@ describe('wf-cancel-tests', () => {
   });
 
   // ==================== Observability Tests ====================
-
-  class EventsTest {
-    @DBOS.workflow()
-    static async eventWorkflow(): Promise<string> {
-      await DBOS.setEvent('key1', 'value1');
-      await DBOS.setEvent('key2', 42);
-      await DBOS.setEvent('key1', 'updated');
-      return DBOS.workflowID!;
-    }
-  }
-
-  test('test-get-all-events', async () => {
-    const handle = await DBOS.startWorkflow(EventsTest).eventWorkflow();
-    const wfid = await handle.getResult();
-
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
-    const events = await sysdb.getAllEvents(wfid);
-    expect(events).toEqual({ key1: 'updated', key2: 42 });
-
-    const emptyEvents = await sysdb.getAllEvents('nonexistent');
-    expect(emptyEvents).toEqual({});
-  });
-
-  class NotifsTest {
-    static recvEvent = new Event();
-
-    @DBOS.workflow()
-    static async receiverWorkflow(): Promise<string> {
-      await DBOS.recv('topic_a');
-      await DBOS.recv('topic_b');
-      NotifsTest.recvEvent.set();
-      return DBOS.workflowID!;
-    }
-  }
-
-  test('test-get-all-notifications', async () => {
-    NotifsTest.recvEvent = new Event();
-
-    const wfid = randomUUID();
-    const handle = await DBOS.startWorkflow(NotifsTest, { workflowID: wfid }).receiverWorkflow();
-
-    await DBOS.send(wfid, 'hello', 'topic_a');
-    await DBOS.send(wfid, { data: 123 }, 'topic_b');
-    await NotifsTest.recvEvent.wait();
-    await handle.getResult();
-
-    // Send a third notification that won't be consumed
-    await DBOS.send(wfid, 'unconsumed', 'topic_c');
-
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
-    const notifications = await sysdb.getAllNotifications(wfid);
-    expect(notifications.length).toBe(3);
-    expect(notifications[0].topic).toBe('topic_a');
-    expect(notifications[0].message).toBe('hello');
-    expect(notifications[0].consumed).toBe(true);
-    expect(notifications[1].topic).toBe('topic_b');
-    expect(notifications[1].message).toEqual({ data: 123 });
-    expect(notifications[1].consumed).toBe(true);
-    expect(notifications[2].topic).toBe('topic_c');
-    expect(notifications[2].message).toBe('unconsumed');
-    expect(notifications[2].consumed).toBe(false);
-
-    expect(await sysdb.getAllNotifications('nonexistent')).toEqual([]);
-  });
-
-  class NullTopicTest {
-    static recvEvent = new Event();
-
-    @DBOS.workflow()
-    static async receiverWorkflow(): Promise<string> {
-      await DBOS.recv();
-      NullTopicTest.recvEvent.set();
-      return DBOS.workflowID!;
-    }
-  }
-
-  test('test-get-all-notifications-null-topic', async () => {
-    NullTopicTest.recvEvent = new Event();
-
-    const wfid = randomUUID();
-    const handle = await DBOS.startWorkflow(NullTopicTest, { workflowID: wfid }).receiverWorkflow();
-
-    await DBOS.send(wfid, 'no_topic_msg');
-    await NullTopicTest.recvEvent.wait();
-    await handle.getResult();
-
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
-    const notifications = await sysdb.getAllNotifications(wfid);
-    expect(notifications.length).toBe(1);
-    expect(notifications[0].topic).toBeNull();
-    expect(notifications[0].message).toBe('no_topic_msg');
-  });
-
-  class StreamsTest {
-    @DBOS.workflow()
-    static async streamWorkflow(): Promise<string> {
-      await DBOS.writeStream('stream_a', 10);
-      await DBOS.writeStream('stream_a', 20);
-      await DBOS.writeStream('stream_b', 'hello');
-      await DBOS.closeStream('stream_a');
-      await DBOS.closeStream('stream_b');
-      return DBOS.workflowID!;
-    }
-  }
-
-  test('test-get-all-stream-entries', async () => {
-    const handle = await DBOS.startWorkflow(StreamsTest).streamWorkflow();
-    const wfid = await handle.getResult();
-
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
-    const streams = await sysdb.getAllStreamEntries(wfid);
-    expect(streams).toEqual({ stream_a: [10, 20], stream_b: ['hello'] });
-
-    expect(await sysdb.getAllStreamEntries('nonexistent')).toEqual({});
-  });
 });

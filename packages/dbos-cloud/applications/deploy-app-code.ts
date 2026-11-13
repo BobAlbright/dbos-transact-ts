@@ -19,7 +19,7 @@ import {
 import path from 'path';
 import { Application } from './types.js';
 import JSZip from 'jszip';
-import fg from 'fast-glob';
+import { glob } from 'tinyglobby';
 import chalk from 'chalk';
 import { registerApp } from './register-app.js';
 import { Logger } from 'winston';
@@ -80,9 +80,11 @@ async function createZipData(logger: CLILogger, deployConfigFile: string): Promi
     '**/.python-version',
   ];
 
-  const files = await fg(globPattern, {
+  const files = await glob(globPattern, {
     dot: true,
     onlyFiles: true,
+    absolute: true,
+    expandDirectories: false,
     ignore: [...hardcodedIgnorePatterns, ...globIgnorePatterns],
   });
 
@@ -176,7 +178,6 @@ async function createJavaZipData(logger: CLILogger, deployConfigFile: string): P
 
 export async function deployAppCode(
   host: string,
-  rollback: boolean,
   previousVersion: string | null,
   verbose: boolean,
   targetDatabaseName: string | null = null, // Used for changing database instance
@@ -355,9 +356,7 @@ export async function deployAppCode(
 
     // Submit the deploy request
     let url = '';
-    if (rollback) {
-      url = `https://${host}/v1alpha1/${userCredentials.organization}/applications/${appName}/rollback`;
-    } else if (targetDatabaseName !== null) {
+    if (targetDatabaseName !== null) {
       url = `https://${host}/v1alpha1/${userCredentials.organization}/applications/${appName}/changedbinstance`;
     } else {
       url = `https://${host}/v1alpha1/${userCredentials.organization}/applications/${appName}`;
@@ -415,15 +414,15 @@ export async function deployAppCode(
     let applicationAvailable = false;
     while (!applicationAvailable) {
       count += 1;
-      if (count % 50 === 0) {
+      if (count % 5 === 0) {
         logger.info(`Waiting for ${appName} with version ${deployOutput.ApplicationVersion} to be available`);
-        if (count > 200) {
+        if (count > 20) {
           logger.info(
             `If ${appName} takes too long to become available, check its logs with 'dbos-cloud applications logs'`,
           );
         }
       }
-      if (count > 1800) {
+      if (count > 180) {
         logger.error('Application taking too long to become available');
         return 1;
       }
@@ -440,7 +439,7 @@ export async function deployAppCode(
           applicationAvailable = true;
         }
       }
-      await sleepms(100);
+      await sleepms(1000);
     }
     logger.info(`Successfully deployed ${appName}!`);
     logger.info(`Access your application at https://${userCredentials.organization}-${appName}.${host}/`);

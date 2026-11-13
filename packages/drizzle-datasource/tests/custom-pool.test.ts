@@ -3,10 +3,7 @@ import { Client, Pool } from 'pg';
 import { DrizzleDataSource } from '..';
 import { dropDB, ensureDB } from './test-helpers';
 import { randomUUID } from 'crypto';
-import SuperJSON from 'superjson';
 import { pgTable, text, integer } from 'drizzle-orm/pg-core';
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { pushSchema } from 'drizzle-kit/api';
 import { sql } from 'drizzle-orm';
 
 const config = { user: 'postgres', database: 'drizzle_pool_test_userdb' };
@@ -42,6 +39,13 @@ async function insertWorkflow(user: string) {
 
 const regInsertWorkflow = DBOS.registerWorkflow(insertWorkflow);
 
+async function currentDatabaseFunction() {
+  const result = await poolDataSource.client.execute<{ current_database: string }>(sql`SELECT current_database()`);
+  return result.rows[0].current_database;
+}
+
+const regCurrentDatabaseFunction = poolDataSource.registerTransaction(currentDatabaseFunction);
+
 interface transaction_completion {
   workflow_id: string;
   function_num: number;
@@ -69,14 +73,9 @@ describe('DrizzleDataSource with custom Pool', () => {
       poolClient.release();
     }
 
-    const drizzlePool = new Pool(config);
-    const db = drizzle(drizzlePool);
-    try {
-      const res = await pushSchema({ greetingsTable }, db);
-      await res.apply();
-    } finally {
-      await drizzlePool.end();
-    }
+    await customPool.query(
+      `CREATE TABLE IF NOT EXISTS greetings (name TEXT PRIMARY KEY NOT NULL, greet_count INTEGER DEFAULT 0)`,
+    );
   });
 
   afterAll(async () => {
@@ -106,9 +105,15 @@ describe('DrizzleDataSource with custom Pool', () => {
       'SELECT * FROM dbos.transaction_completion WHERE workflow_id = $1',
       [workflowID],
     );
-    expect(rows.length).toBe(1);
-    expect(rows[0].output).not.toBeNull();
-    expect(SuperJSON.parse(rows[0].output!)).toMatchObject({ user, greet_count: 1 });
+    // Completion cleared the checkpoint the transaction wrote.
+    expect(rows).toHaveLength(0);
+  });
+
+  test('transaction runs against the custom pool database', async () => {
+    // Guards against the datasource creating its own connection to the default database
+    // instead of using the caller's pool (drizzle-orm 1.0 positional-overload regression).
+    const dbName = await regCurrentDatabaseFunction();
+    expect(dbName).toBe(config.database);
   });
 
   test('custom pool is not closed after DBOS shutdown', async () => {
